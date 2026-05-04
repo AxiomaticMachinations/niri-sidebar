@@ -32,7 +32,12 @@ pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resul
         is_floating: window.is_floating,
         position: window.layout.tile_pos_in_workspace_view,
     };
-    ctx.state.windows.push(w_state);
+    let insert_index = if ctx.state.is_flipped {
+        0
+    } else {
+        ctx.state.windows.len()
+    };
+    ctx.state.windows.insert(insert_index, w_state);
 
     if !window.is_floating {
         let _ = ctx.socket.send_action(Action::ToggleWindowFloating {
@@ -106,7 +111,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, StackDirection};
     use crate::state::AppState;
     use crate::test_utils::{MockNiri, mock_config, mock_window};
 
@@ -244,6 +249,116 @@ mod tests {
             Action::SetWindowHeight {
                 change: SizeChange::SetFixed(600),
                 id: Some(100)
+            }
+        )));
+    }
+
+    #[test]
+    fn test_add_to_sidebar_top_to_bottom_flipped_places_new_window_at_bottom() {
+        let temp_dir = tempdir().unwrap();
+        let existing = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        let new_window = mock_window(2, true, true, 1, Some((1.0, 2.0)));
+        let mock = MockNiri::new(vec![existing, new_window]);
+
+        let mut config = mock_config();
+        config.interaction.stack_direction = StackDirection::TopToBottom;
+
+        let mut state = AppState {
+            is_flipped: true,
+            ..Default::default()
+        };
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: true,
+            position: Some((1.0, 2.0)),
+        });
+
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        toggle_window(&mut ctx).expect("Command failed");
+
+        assert_eq!(
+            ctx.state.windows.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let actions = &ctx.socket.sent_actions;
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(1),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(50.0)
+            }
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(2),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(260.0)
+            }
+        )));
+    }
+
+    #[test]
+    fn test_add_to_sidebar_bottom_to_top_flipped_places_new_window_at_top() {
+        let temp_dir = tempdir().unwrap();
+        let existing = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        let new_window = mock_window(2, true, true, 1, Some((1.0, 2.0)));
+        let mock = MockNiri::new(vec![existing, new_window]);
+
+        let mut config = mock_config();
+        config.interaction.stack_direction = StackDirection::BottomToTop;
+
+        let mut state = AppState {
+            is_flipped: true,
+            ..Default::default()
+        };
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: true,
+            position: Some((1.0, 2.0)),
+        });
+
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        toggle_window(&mut ctx).expect("Command failed");
+
+        assert_eq!(
+            ctx.state.windows.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let actions = &ctx.socket.sent_actions;
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(1),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(830.0)
+            }
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(2),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(620.0)
             }
         )));
     }

@@ -1,4 +1,4 @@
-use crate::config::SidebarPosition;
+use crate::config::{SidebarPosition, StackDirection};
 use crate::niri::NiriClient;
 use crate::state::save_state;
 use crate::window_rules::{resolve_rule_focus_peek, resolve_rule_peek, resolve_window_size};
@@ -30,6 +30,7 @@ fn calculate_coordinates<C: NiriClient>(
     let margins = &ctx.config.margins;
     let (sw, sh) = screen;
     let (w, h) = (dims.width, dims.height);
+    let stack_direction = ctx.config.interaction.get_stack_direction();
 
     match pos {
         SidebarPosition::Right => {
@@ -37,8 +38,13 @@ fn calculate_coordinates<C: NiriClient>(
             let hidden_x = sw - active_peek;
             let x = if state.is_hidden { hidden_x } else { visible_x };
 
-            let start_y = sh - h - margins.bottom;
-            let y = start_y - stack_offset;
+            let y = match stack_direction {
+                StackDirection::TopToBottom => margins.top + stack_offset,
+                StackDirection::BottomToTop => sh - h - margins.bottom - stack_offset,
+                _ => unreachable!(
+                    "stack direction should already be normalized for sidebar position"
+                ),
+            };
             (x, y)
         }
         SidebarPosition::Left => {
@@ -46,13 +52,23 @@ fn calculate_coordinates<C: NiriClient>(
             let hidden_x = -w + active_peek;
             let x = if state.is_hidden { hidden_x } else { visible_x };
 
-            let start_y = sh - h - margins.bottom;
-            let y = start_y - stack_offset;
+            let y = match stack_direction {
+                StackDirection::TopToBottom => margins.top + stack_offset,
+                StackDirection::BottomToTop => sh - h - margins.bottom - stack_offset,
+                _ => unreachable!(
+                    "stack direction should already be normalized for sidebar position"
+                ),
+            };
             (x, y)
         }
         SidebarPosition::Bottom => {
-            let start_x = margins.left;
-            let x = start_x + stack_offset;
+            let x = match stack_direction {
+                StackDirection::LeftToRight => margins.left + stack_offset,
+                StackDirection::RightToLeft => sw - w - margins.right - stack_offset,
+                _ => unreachable!(
+                    "stack direction should already be normalized for sidebar position"
+                ),
+            };
 
             let visible_y = sh - h - margins.bottom;
             let hidden_y = sh - active_peek;
@@ -60,8 +76,13 @@ fn calculate_coordinates<C: NiriClient>(
             (x, y)
         }
         SidebarPosition::Top => {
-            let start_x = margins.left;
-            let x = start_x + stack_offset;
+            let x = match stack_direction {
+                StackDirection::LeftToRight => margins.left + stack_offset,
+                StackDirection::RightToLeft => sw - w - margins.right - stack_offset,
+                _ => unreachable!(
+                    "stack direction should already be normalized for sidebar position"
+                ),
+            };
 
             let visible_y = margins.top;
             let hidden_y = -h + active_peek;
@@ -519,6 +540,120 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(a,
             Action::MoveFloatingWindow { id: Some(2), x: PositionChange::SetFixed(x), .. }
             if *x == 130.0
+        )));
+    }
+
+    #[test]
+    fn test_top_to_bottom_stacking_order() {
+        let temp_dir = tempdir().unwrap();
+        let w1 = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        let w2 = mock_window(2, false, true, 1, Some((1.0, 2.0)));
+        let mock = MockNiri::new(vec![w1, w2]);
+
+        let mut config = mock_config();
+        config.interaction.stack_direction = StackDirection::TopToBottom;
+
+        let mut state = AppState::default();
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: false,
+            position: None,
+        });
+        state.windows.push(WindowState {
+            id: 2,
+            width: 300,
+            height: 200,
+            is_floating: false,
+            position: None,
+        });
+
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        let actions = &ctx.socket.sent_actions;
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(1),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(50.0)
+            }
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(2),
+                x: PositionChange::SetFixed(1600.0),
+                y: PositionChange::SetFixed(260.0)
+            }
+        )));
+    }
+
+    #[test]
+    fn test_top_to_bottom_uses_window_heights_for_offsets() {
+        let temp_dir = tempdir().unwrap();
+        let w1 = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        let mut w2 = mock_window(2, false, true, 1, Some((1.0, 2.0)));
+        w2.app_id = Some("tall".into());
+        let mock = MockNiri::new(vec![w1, w2]);
+
+        let mut config = mock_config();
+        config.interaction.stack_direction = StackDirection::TopToBottom;
+        config.window_rule = vec![WindowRule {
+            app_id: Some(Regex::new("tall").unwrap()),
+            height: Some(400),
+            ..Default::default()
+        }];
+
+        let mut state = AppState::default();
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: false,
+            position: None,
+        });
+        state.windows.push(WindowState {
+            id: 2,
+            width: 300,
+            height: 200,
+            is_floating: false,
+            position: None,
+        });
+
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        let actions = &ctx.socket.sent_actions;
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(1),
+                y: PositionChange::SetFixed(50.0),
+                ..
+            }
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(2),
+                y: PositionChange::SetFixed(260.0),
+                ..
+            }
         )));
     }
 

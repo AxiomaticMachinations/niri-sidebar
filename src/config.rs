@@ -15,6 +15,16 @@ pub enum SidebarPosition {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackDirection {
+    Auto,
+    TopToBottom,
+    BottomToTop,
+    LeftToRight,
+    RightToLeft,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub geometry: Geometry,
@@ -49,6 +59,8 @@ pub struct Interaction {
     pub focus_peek: Option<i32>,
     #[serde(default = "default_position")]
     pub position: SidebarPosition,
+    #[serde(default = "default_stack_direction")]
+    pub stack_direction: StackDirection,
     #[serde(default = "default_sticky")]
     pub sticky: bool,
 }
@@ -57,14 +69,46 @@ impl Interaction {
     pub fn get_focus_peek(&self) -> i32 {
         self.focus_peek.unwrap_or(self.peek)
     }
+
+    pub fn get_stack_direction(&self) -> StackDirection {
+        match (self.position, self.stack_direction) {
+            (_, StackDirection::Auto) => default_stack_direction_for_position(self.position),
+            (
+                SidebarPosition::Left | SidebarPosition::Right,
+                StackDirection::TopToBottom | StackDirection::BottomToTop,
+            ) => self.stack_direction,
+            (
+                SidebarPosition::Top | SidebarPosition::Bottom,
+                StackDirection::LeftToRight | StackDirection::RightToLeft,
+            ) => self.stack_direction,
+            _ => {
+                eprintln!(
+                    "interaction.stack_direction {:?} is not compatible with {:?}; using the default for that position.",
+                    self.stack_direction, self.position
+                );
+                default_stack_direction_for_position(self.position)
+            }
+        }
+    }
 }
 
 fn default_sticky() -> bool {
     false
 }
 
+fn default_stack_direction() -> StackDirection {
+    StackDirection::Auto
+}
+
 fn default_position() -> SidebarPosition {
     SidebarPosition::Right
+}
+
+fn default_stack_direction_for_position(position: SidebarPosition) -> StackDirection {
+    match position {
+        SidebarPosition::Left | SidebarPosition::Right => StackDirection::BottomToTop,
+        SidebarPosition::Top | SidebarPosition::Bottom => StackDirection::LeftToRight,
+    }
 }
 
 fn default_margin() -> i32 {
@@ -131,4 +175,71 @@ pub fn init_config() -> Result<()> {
     fs::write(&path, DEFAULT_CONFIG_STR)?;
     println!("Default config written to {:?}", path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_interaction_stack_direction_defaults_to_auto() {
+        let config: Config = toml::from_str(
+            r#"
+                [geometry]
+                width = 400
+                height = 335
+                gap = 10
+
+                [margins]
+                top = 50
+                right = 10
+                left = 10
+                bottom = 10
+
+                [interaction]
+                position = "right"
+                peek = 10
+                focus_peek = 50
+                sticky = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.interaction.stack_direction, StackDirection::Auto);
+        assert_eq!(
+            config.interaction.get_stack_direction(),
+            StackDirection::BottomToTop
+        );
+    }
+
+    #[test]
+    fn test_interaction_stack_direction_can_be_top_to_bottom() {
+        let config: Config = toml::from_str(
+            r#"
+                [geometry]
+                width = 400
+                height = 335
+                gap = 10
+
+                [margins]
+                top = 50
+                right = 10
+                left = 10
+                bottom = 10
+
+                [interaction]
+                position = "right"
+                peek = 10
+                focus_peek = 50
+                stack_direction = "top_to_bottom"
+                sticky = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.interaction.get_stack_direction(),
+            StackDirection::TopToBottom
+        );
+    }
 }

@@ -23,6 +23,10 @@ bottom = 10
 # Where to put the sidebar, can be "left", "right", "top" or "bottom"
 # Defaults to "right"
 position = "right"
+# How windows stack inside the sidebar.
+# For left/right sidebars use "top_to_bottom" or "bottom_to_top".
+# For top/bottom bars use "left_to_right" or "right_to_left".
+stack_direction = "bottom_to_top"
 # Width of windows when sidebar is hidden in pixels
 peek = 10
 # Width of window when sidebar is hidden but window is focused in pixels
