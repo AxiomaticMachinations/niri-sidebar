@@ -98,6 +98,9 @@ pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resul
         ctx.state.windows.len()
     };
     ctx.state.windows.insert(insert_index, w_state);
+    if let Some(workspace_id) = window.workspace_id {
+        ctx.state.window_workspaces.insert(window.id, workspace_id);
+    }
 
     if !window.is_floating {
         let _ = ctx.socket.send_action(Action::ToggleWindowFloating {
@@ -132,6 +135,7 @@ fn remove_from_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resu
         .context("Window was not found in sidebar state")?;
 
     let w_state = ctx.state.windows.remove(index);
+    ctx.state.window_workspaces.remove(&w_state.id);
     ctx.state.ignored_windows.push(w_state.id);
 
     if window.is_floating && !w_state.is_floating {

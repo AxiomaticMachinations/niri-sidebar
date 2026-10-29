@@ -99,6 +99,10 @@ tracked window with niri's normal workspace or monitor actions (for example,
 sidebar on its destination workspace. Hover zones are created on every active output
 that currently contains tracked sidebar windows.
 
+When a tracked window moves to another workspace or monitor, it is appended to the
+end of that destination sidebar's displayed order. With a top-to-bottom stack this
+places it at the bottom. `flip` still reverses the displayed order on every sidebar.
+
 In order for your sidebar to stay consistent and gap free, you want to add the following to your startup scripts
 
 ```kdl

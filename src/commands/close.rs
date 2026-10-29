@@ -14,6 +14,7 @@ pub fn close<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
 
     if let Some(index) = ctx.state.windows.iter().position(|w| w.id == focused.id) {
         ctx.state.windows.remove(index);
+        ctx.state.window_workspaces.remove(&focused.id);
         save_state(&ctx.state, &ctx.cache_dir)?;
     }
 

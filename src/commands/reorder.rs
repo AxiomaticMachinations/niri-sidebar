@@ -5,7 +5,7 @@ use crate::window_rules::{resolve_rule_focus_peek, resolve_rule_peek, resolve_wi
 use crate::{Ctx, WindowTarget};
 use anyhow::Result;
 use niri_ipc::{Action, PositionChange, Window};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn resolve_dimensions<C: NiriClient>(window: &Window, ctx: &Ctx<C>) -> WindowTarget {
     let (width, height) = resolve_window_size(
@@ -121,15 +121,18 @@ pub(crate) fn reconcile_positions<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<boo
         .map(|workspace| workspace.id)
         .collect();
 
-    let sidebar_ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
-
     let initial_len = ctx.state.windows.len();
     let active_ids: HashSet<u64> = all_windows.iter().map(|w| w.id).collect();
 
     ctx.state.windows.retain(|w| active_ids.contains(&w.id));
-    if ctx.state.windows.len() != initial_len {
+    ctx.state
+        .window_workspaces
+        .retain(|id, _| active_ids.contains(id));
+    let order_changed = append_transferred_windows(&mut ctx.state, &all_windows);
+    if ctx.state.windows.len() != initial_len || order_changed {
         save_state(&ctx.state, &ctx.cache_dir)?;
     }
+    let sidebar_ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
 
     let position = ctx.config.interaction.position;
     let gap = ctx.config.geometry.gap;
@@ -224,6 +227,69 @@ pub(crate) fn reconcile_positions<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<boo
     }
 
     Ok(changed)
+}
+
+fn append_transferred_windows(state: &mut crate::state::AppState, windows: &[Window]) -> bool {
+    let actual_workspaces: HashMap<u64, u64> = windows
+        .iter()
+        .filter_map(|window| window.workspace_id.map(|workspace| (window.id, workspace)))
+        .collect();
+    let tracked_ids: HashSet<u64> = state.windows.iter().map(|window| window.id).collect();
+    let mut changed_destinations: HashMap<u64, u64> = HashMap::new();
+    let mut state_changed = false;
+
+    for (&id, &workspace) in &actual_workspaces {
+        if !tracked_ids.contains(&id) {
+            continue;
+        }
+        let previous = state.window_workspaces.get(&id).copied();
+        if previous.is_some_and(|previous| previous != workspace) {
+            changed_destinations.insert(id, workspace);
+        }
+        state_changed |= previous != Some(workspace);
+        state.window_workspaces.insert(id, workspace);
+    }
+    let workspace_count = state.window_workspaces.len();
+    state
+        .window_workspaces
+        .retain(|id, _| tracked_ids.contains(id));
+    state_changed |= workspace_count != state.window_workspaces.len();
+
+    if changed_destinations.is_empty() {
+        return state_changed;
+    }
+
+    let mut effective = std::mem::take(&mut state.windows);
+    if state.is_flipped {
+        effective.reverse();
+    }
+    let mut destinations: Vec<u64> = changed_destinations.values().copied().collect();
+    destinations.sort_unstable();
+    destinations.dedup();
+
+    for destination in destinations {
+        let mut moved = Vec::new();
+        let mut remaining = Vec::with_capacity(effective.len());
+        for window in effective {
+            if changed_destinations.get(&window.id) == Some(&destination) {
+                moved.push(window);
+            } else {
+                remaining.push(window);
+            }
+        }
+        let insertion = remaining
+            .iter()
+            .rposition(|window| actual_workspaces.get(&window.id) == Some(&destination))
+            .map_or(remaining.len(), |index| index + 1);
+        remaining.splice(insertion..insertion, moved);
+        effective = remaining;
+    }
+
+    if state.is_flipped {
+        effective.reverse();
+    }
+    state.windows = effective;
+    true
 }
 
 fn clamp_floating_position(
@@ -439,6 +505,73 @@ mod tests {
                 } if *action_id == id
             )));
         }
+    }
+
+    #[test]
+    fn test_transferred_window_appends_to_destination_order() {
+        let mut state = AppState::default();
+        for id in [1, 2, 3, 4] {
+            state.windows.push(WindowState {
+                id,
+                width: 100,
+                height: 100,
+                is_floating: true,
+                position: None,
+            });
+        }
+        state.window_workspaces = HashMap::from([(1, 1), (2, 2), (3, 2), (4, 1)]);
+        let windows = vec![
+            mock_window(1, false, true, 2, None),
+            mock_window(2, false, true, 2, None),
+            mock_window(3, false, true, 2, None),
+            mock_window(4, false, true, 1, None),
+        ];
+
+        assert!(append_transferred_windows(&mut state, &windows));
+
+        let destination_order: Vec<u64> = state
+            .windows
+            .iter()
+            .filter(|window| state.window_workspaces.get(&window.id) == Some(&2))
+            .map(|window| window.id)
+            .collect();
+        assert_eq!(destination_order, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_transferred_window_appends_when_order_is_flipped() {
+        let mut state = AppState {
+            is_flipped: true,
+            ..Default::default()
+        };
+        // Stored order is reversed when displayed.
+        for id in [4, 3, 2, 1] {
+            state.windows.push(WindowState {
+                id,
+                width: 100,
+                height: 100,
+                is_floating: true,
+                position: None,
+            });
+        }
+        state.window_workspaces = HashMap::from([(1, 1), (2, 2), (3, 2), (4, 1)]);
+        let windows = vec![
+            mock_window(1, false, true, 2, None),
+            mock_window(2, false, true, 2, None),
+            mock_window(3, false, true, 2, None),
+            mock_window(4, false, true, 1, None),
+        ];
+
+        assert!(append_transferred_windows(&mut state, &windows));
+
+        let destination_order: Vec<u64> = state
+            .windows
+            .iter()
+            .rev()
+            .filter(|window| state.window_workspaces.get(&window.id) == Some(&2))
+            .map(|window| window.id)
+            .collect();
+        assert_eq!(destination_order, vec![2, 3, 1]);
     }
 
     #[test]

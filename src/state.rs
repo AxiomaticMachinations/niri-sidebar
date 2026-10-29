@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,9 @@ pub struct AppState {
     // Window revealed by hovering its edge strip while the sidebar is hidden
     #[serde(default)]
     pub revealed: Option<u64>,
+    // Last observed workspace for each tracked window, used to detect transfers.
+    #[serde(default)]
+    pub window_workspaces: HashMap<u64, u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -84,6 +88,7 @@ mod tests {
             is_hidden: true,
             is_flipped: true,
             revealed: Some(100),
+            window_workspaces: HashMap::from([(100, 1), (200, 2)]),
         };
 
         save_state(&original_state, temp_dir.path()).expect("Failed to save state");

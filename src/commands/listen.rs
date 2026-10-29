@@ -171,6 +171,7 @@ fn update_closed_window<C: NiriClient>(ctx: &mut Ctx<C>, closed_id: u64) -> Resu
         println!("Sidebar window {} closed. Reordering...", closed_id);
 
         ctx.state.windows.remove(index);
+        ctx.state.window_workspaces.remove(&closed_id);
         save_state(&ctx.state, &ctx.cache_dir)?;
         dbg!(&ctx.state);
         return Ok(true);
