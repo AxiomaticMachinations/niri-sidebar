@@ -1,5 +1,5 @@
 use crate::config::{SidebarPosition, StackDirection};
-use crate::niri::NiriClient;
+use crate::niri::{NiriClient, sidebar_workspace};
 use crate::state::save_state;
 use crate::window_rules::{resolve_rule_focus_peek, resolve_rule_peek, resolve_window_size};
 use crate::{Ctx, WindowTarget};
@@ -108,11 +108,12 @@ fn calculate_coordinates<C: NiriClient>(
 }
 
 pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
-    let (display_w, display_h) = ctx.socket.get_screen_dimensions()?;
-    let current_ws = ctx.socket.get_active_workspace()?.id;
+    let focused_ws = ctx.socket.get_active_workspace()?.id;
     let all_windows = ctx.socket.get_windows()?;
 
     let sidebar_ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
+    let current_ws = sidebar_workspace(&all_windows, &sidebar_ids, focused_ws);
+    let (display_w, display_h) = ctx.socket.get_workspace_dimensions(current_ws)?;
     let mut sidebar_windows: Vec<_> = all_windows
         .iter()
         .filter(|w| {

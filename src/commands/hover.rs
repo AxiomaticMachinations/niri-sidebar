@@ -3,7 +3,7 @@ use super::listen::get_ctx;
 use super::reorder::reorder;
 use crate::NiriClient;
 use crate::config::{Config, HoverMode, SidebarPosition};
-use crate::niri::connect;
+use crate::niri::{connect, sidebar_workspace};
 use crate::state::{get_default_cache_dir, load_state, save_state};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
@@ -271,14 +271,19 @@ impl Hover {
         let mut layout = Vec::new();
         if state.is_hidden {
             let mut socket = connect()?;
-            let ws = socket.get_active_workspace()?.id;
+            let all_windows = socket.get_windows()?;
+            let sidebar_ids: Vec<u64> = state.windows.iter().map(|s| s.id).collect();
+            let focused_ws = socket.get_active_workspace()?.id;
+            let ws = sidebar_workspace(&all_windows, &sidebar_ids, focused_ws);
             let position = self.cfg.position;
             let vertical = is_vertical_edge(position);
-            let (sw, sh) = socket.get_screen_dimensions()?;
-            for w in socket.get_windows()? {
+            let (sw, sh) = socket.get_workspace_dimensions(ws)?;
+            for w in all_windows {
                 let (Some(pos), true) = (
                     w.layout.tile_pos_in_workspace_view,
+                    // A focused window is already shown; a strip over it would block its input
                     w.is_floating
+                        && !w.is_focused
                         && w.workspace_id == Some(ws)
                         && state.windows.iter().any(|s| s.id == w.id),
                 ) else {

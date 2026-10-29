@@ -8,6 +8,10 @@ pub trait NiriClient {
     fn get_active_window(&mut self) -> Result<Window>;
     fn get_active_workspace(&mut self) -> Result<Workspace>;
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)>;
+    /// Logical size of the output a workspace is on.
+    fn get_workspace_dimensions(&mut self, _workspace_id: u64) -> Result<(i32, i32)> {
+        self.get_screen_dimensions()
+    }
     fn send_action(&mut self, action: Action) -> Result<Response>;
 }
 
@@ -42,10 +46,19 @@ impl NiriClient for Socket {
     }
 
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)> {
-        let workspace = self.get_active_workspace()?;
-        let target_output_name = workspace
-            .output
-            .context("Focused workspace is not on an output")?;
+        let id = self.get_active_workspace()?.id;
+        self.get_workspace_dimensions(id)
+    }
+
+    fn get_workspace_dimensions(&mut self, workspace_id: u64) -> Result<(i32, i32)> {
+        let target_output_name = match self.send(Request::Workspaces)? {
+            Ok(Response::Workspaces(workspaces)) => workspaces
+                .into_iter()
+                .find(|w| w.id == workspace_id)
+                .and_then(|w| w.output)
+                .context("Workspace is not on an output")?,
+            _ => bail!("Unexpected response from Niri when fetching workspaces"),
+        };
 
         match self.send(Request::Outputs)? {
             Ok(Response::Outputs(outputs)) => {
@@ -71,5 +84,48 @@ impl NiriClient for Socket {
     fn send_action(&mut self, action: Action) -> Result<Response> {
         self.send(Request::Action(action))?
             .map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+/// The workspace the sidebar lives on: the focused one if it holds sidebar windows,
+/// otherwise wherever the sidebar windows are (e.g. focus is on another monitor).
+pub fn sidebar_workspace(windows: &[Window], sidebar_ids: &[u64], focused_ws: u64) -> u64 {
+    let mut sidebar = sidebar_ids
+        .iter()
+        .filter_map(|id| windows.iter().find(|w| w.id == *id && w.is_floating))
+        .filter_map(|w| w.workspace_id);
+    let first = sidebar.next();
+    if first == Some(focused_ws) || sidebar.any(|ws| ws == focused_ws) {
+        return focused_ws;
+    }
+    first.unwrap_or(focused_ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::mock_window;
+
+    #[test]
+    fn sidebar_workspace_follows_sidebar_windows_when_focus_is_elsewhere() {
+        let windows = vec![
+            mock_window(1, false, true, 1, None),
+            mock_window(2, true, false, 2, None),
+        ];
+        assert_eq!(sidebar_workspace(&windows, &[1], 2), 1);
+    }
+
+    #[test]
+    fn sidebar_workspace_prefers_focused_workspace_when_it_has_sidebar_windows() {
+        let windows = vec![
+            mock_window(1, false, true, 1, None),
+            mock_window(2, false, true, 2, None),
+        ];
+        assert_eq!(sidebar_workspace(&windows, &[1, 2], 2), 2);
+    }
+
+    #[test]
+    fn sidebar_workspace_falls_back_to_focused_without_sidebar_windows() {
+        assert_eq!(sidebar_workspace(&[], &[], 3), 3);
     }
 }
