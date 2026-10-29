@@ -1,5 +1,5 @@
 use crate::config::{SidebarPosition, StackDirection};
-use crate::niri::{NiriClient, sidebar_workspace};
+use crate::niri::NiriClient;
 use crate::state::save_state;
 use crate::window_rules::{resolve_rule_focus_peek, resolve_rule_peek, resolve_window_size};
 use crate::{Ctx, WindowTarget};
@@ -112,18 +112,16 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
 }
 
 pub(crate) fn reconcile_positions<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<bool> {
-    let focused_ws = ctx.socket.get_active_workspace()?.id;
     let all_windows = ctx.socket.get_windows()?;
+    let active_workspaces: HashSet<u64> = ctx
+        .socket
+        .get_workspaces()?
+        .into_iter()
+        .filter(|workspace| workspace.is_active)
+        .map(|workspace| workspace.id)
+        .collect();
 
     let sidebar_ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
-    let current_ws = sidebar_workspace(&all_windows, &sidebar_ids, focused_ws);
-    let (display_w, display_h) = ctx.socket.get_workspace_dimensions(current_ws)?;
-    let mut sidebar_windows: Vec<_> = all_windows
-        .iter()
-        .filter(|w| {
-            w.is_floating && w.workspace_id == Some(current_ws) && sidebar_ids.contains(&w.id)
-        })
-        .collect();
 
     let initial_len = ctx.state.windows.len();
     let active_ids: HashSet<u64> = all_windows.iter().map(|w| w.id).collect();
@@ -133,87 +131,96 @@ pub(crate) fn reconcile_positions<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<boo
         save_state(&ctx.state, &ctx.cache_dir)?;
     }
 
-    // Sort by ID for stable ordering
-    sidebar_windows.sort_by_key(|w| {
-        sidebar_ids
-            .iter()
-            .position(|id| *id == w.id)
-            .unwrap_or(usize::MAX)
-    });
-    if ctx.state.is_flipped {
-        sidebar_windows.reverse();
-    }
-
     let position = ctx.config.interaction.position;
     let gap = ctx.config.geometry.gap;
-
-    let mut current_stack_offset = 0;
     let mut changed = false;
 
-    for window in sidebar_windows.iter() {
-        let dims = resolve_dimensions(window, ctx);
-
-        let window_focus_peek = resolve_rule_focus_peek(
-            &ctx.config.window_rule,
-            window,
-            ctx.config.interaction.get_focus_peek(),
-        );
-        let active_peek = if window.is_focused || ctx.state.revealed == Some(window.id) {
-            window_focus_peek
-        } else {
-            resolve_rule_peek(&ctx.config.window_rule, window, ctx.config.interaction.peek)
-        };
-
-        let (target_x, target_y) = calculate_coordinates(
-            position,
-            dims,
-            (display_w, display_h),
-            current_stack_offset,
-            active_peek,
-            window_focus_peek,
-            ctx,
-        );
-        let tile_size = window.layout.tile_size;
-        let clamp_size = (
-            if tile_size.0 > 0.0 {
-                tile_size.0
-            } else {
-                f64::from(dims.width)
-            },
-            if tile_size.1 > 0.0 {
-                tile_size.1
-            } else {
-                f64::from(dims.height)
-            },
-        );
-        let (effective_x, effective_y) =
-            clamp_floating_position((target_x, target_y), (display_w, display_h), clamp_size);
-
-        match position {
-            SidebarPosition::Left | SidebarPosition::Right => {
-                current_stack_offset += dims.height + gap;
-            }
-            SidebarPosition::Top | SidebarPosition::Bottom => {
-                current_stack_offset += dims.width + gap;
-            }
-        }
-
-        let position_matches = window
-            .layout
-            .tile_pos_in_workspace_view
-            .is_some_and(|(x, y)| {
-                (x - f64::from(effective_x)).abs() < 0.5 && (y - f64::from(effective_y)).abs() < 0.5
-            });
-        if position_matches {
-            continue;
-        }
-
-        let _ = ctx.socket.send_action(Action::MoveFloatingWindow {
-            id: Some(window.id),
-            x: PositionChange::SetFixed(target_x.into()),
-            y: PositionChange::SetFixed(target_y.into()),
+    for workspace_id in active_workspaces {
+        let (display_w, display_h) = ctx.socket.get_workspace_dimensions(workspace_id)?;
+        let mut sidebar_windows: Vec<_> = all_windows
+            .iter()
+            .filter(|window| {
+                window.is_floating
+                    && window.workspace_id == Some(workspace_id)
+                    && sidebar_ids.contains(&window.id)
+            })
+            .collect();
+        sidebar_windows.sort_by_key(|window| {
+            sidebar_ids
+                .iter()
+                .position(|id| *id == window.id)
+                .unwrap_or(usize::MAX)
         });
-        changed = true;
+        if ctx.state.is_flipped {
+            sidebar_windows.reverse();
+        }
+
+        let mut current_stack_offset = 0;
+        for window in sidebar_windows {
+            let dims = resolve_dimensions(window, ctx);
+            let window_focus_peek = resolve_rule_focus_peek(
+                &ctx.config.window_rule,
+                window,
+                ctx.config.interaction.get_focus_peek(),
+            );
+            let active_peek = if window.is_focused || ctx.state.revealed == Some(window.id) {
+                window_focus_peek
+            } else {
+                resolve_rule_peek(&ctx.config.window_rule, window, ctx.config.interaction.peek)
+            };
+            let (target_x, target_y) = calculate_coordinates(
+                position,
+                dims,
+                (display_w, display_h),
+                current_stack_offset,
+                active_peek,
+                window_focus_peek,
+                ctx,
+            );
+            let tile_size = window.layout.tile_size;
+            let clamp_size = (
+                if tile_size.0 > 0.0 {
+                    tile_size.0
+                } else {
+                    f64::from(dims.width)
+                },
+                if tile_size.1 > 0.0 {
+                    tile_size.1
+                } else {
+                    f64::from(dims.height)
+                },
+            );
+            let (effective_x, effective_y) =
+                clamp_floating_position((target_x, target_y), (display_w, display_h), clamp_size);
+
+            match position {
+                SidebarPosition::Left | SidebarPosition::Right => {
+                    current_stack_offset += dims.height + gap;
+                }
+                SidebarPosition::Top | SidebarPosition::Bottom => {
+                    current_stack_offset += dims.width + gap;
+                }
+            }
+
+            let position_matches =
+                window
+                    .layout
+                    .tile_pos_in_workspace_view
+                    .is_some_and(|(x, y)| {
+                        (x - f64::from(effective_x)).abs() < 0.5
+                            && (y - f64::from(effective_y)).abs() < 0.5
+                    });
+            if position_matches {
+                continue;
+            }
+
+            let _ = ctx.socket.send_action(Action::MoveFloatingWindow {
+                id: Some(window.id),
+                x: PositionChange::SetFixed(target_x.into()),
+                y: PositionChange::SetFixed(target_y.into()),
+            });
+            changed = true;
+        }
     }
 
     Ok(changed)
@@ -242,7 +249,7 @@ mod tests {
     use super::*;
     use crate::config::WindowRule;
     use crate::state::{AppState, WindowState};
-    use crate::test_utils::{MockNiri, mock_config, mock_window};
+    use crate::test_utils::{MockNiri, mock_config, mock_window, mock_workspace};
     use niri_ipc::{Action, PositionChange};
     use regex::Regex;
     use tempfile::tempdir;
@@ -391,6 +398,47 @@ mod tests {
         reorder(&mut ctx).expect("Reorder failed");
 
         assert!(ctx.socket.sent_actions.is_empty());
+    }
+
+    #[test]
+    fn test_reorder_stacks_each_active_workspace_independently() {
+        let temp_dir = tempdir().unwrap();
+        let first = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        let second = mock_window(2, false, true, 2, Some((1.0, 2.0)));
+        let mock = MockNiri::new(vec![first, second]).with_workspaces(vec![
+            mock_workspace(1, "DP-1", true, true),
+            mock_workspace(2, "DP-2", true, false),
+        ]);
+        let mut state = AppState::default();
+        for id in [1, 2] {
+            state.windows.push(WindowState {
+                id,
+                width: 300,
+                height: 200,
+                is_floating: true,
+                position: Some((1.0, 2.0)),
+            });
+        }
+        let mut ctx = Ctx {
+            state,
+            config: mock_config(),
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        assert_eq!(ctx.socket.sent_actions.len(), 2);
+        for id in [1, 2] {
+            assert!(ctx.socket.sent_actions.iter().any(|action| matches!(
+                action,
+                Action::MoveFloatingWindow {
+                    id: Some(action_id),
+                    x: PositionChange::SetFixed(1600.0),
+                    y: PositionChange::SetFixed(830.0),
+                } if *action_id == id
+            )));
+        }
     }
 
     #[test]

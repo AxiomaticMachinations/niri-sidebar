@@ -7,6 +7,7 @@ use niri_ipc::{Action, Response, Window, WindowLayout, Workspace};
 pub struct MockNiri {
     pub windows: Vec<Window>,
     pub sent_actions: Vec<Action>,
+    pub workspaces: Vec<Workspace>,
 }
 
 impl MockNiri {
@@ -14,13 +15,23 @@ impl MockNiri {
         Self {
             windows,
             sent_actions: vec![],
+            workspaces: vec![mock_workspace(1, "eDP-1", true, true)],
         }
+    }
+
+    pub fn with_workspaces(mut self, workspaces: Vec<Workspace>) -> Self {
+        self.workspaces = workspaces;
+        self
     }
 }
 
 impl NiriClient for MockNiri {
     fn get_windows(&mut self) -> Result<Vec<Window>> {
         Ok(self.windows.clone())
+    }
+
+    fn get_workspaces(&mut self) -> Result<Vec<Workspace>> {
+        Ok(self.workspaces.clone())
     }
 
     fn get_active_window(&mut self) -> Result<Window> {
@@ -37,16 +48,11 @@ impl NiriClient for MockNiri {
     }
 
     fn get_active_workspace(&mut self) -> Result<Workspace> {
-        Ok(Workspace {
-            id: 1,
-            idx: 0,
-            name: Some("test".into()),
-            output: Some("eDP-1".into()),
-            is_urgent: false,
-            is_active: true,
-            is_focused: true,
-            active_window_id: None,
-        })
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.is_focused)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No active workspace in mock"))
     }
 
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)> {
@@ -55,6 +61,19 @@ impl NiriClient for MockNiri {
 
     fn get_workspace_output(&mut self, _workspace_id: u64) -> Result<String> {
         Ok("eDP-1".into())
+    }
+}
+
+pub fn mock_workspace(id: u64, output: &str, is_active: bool, is_focused: bool) -> Workspace {
+    Workspace {
+        id,
+        idx: id as u8,
+        name: Some(format!("test-{id}")),
+        output: Some(output.into()),
+        is_urgent: false,
+        is_active,
+        is_focused,
+        active_window_id: None,
     }
 }
 

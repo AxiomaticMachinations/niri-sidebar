@@ -38,12 +38,34 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::time::Duration;
+use std::{collections::HashMap, fmt};
 
 // Extra room around the sidebar so grazing its edge doesn't trigger a collapse
 const SAFE_PAD: i32 = 8;
 const SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
 type Rect = (i32, i32, i32, i32);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ZoneLayout {
+    id: Option<u64>,
+    output: String,
+    start: i32,
+    len: i32,
+    width: i32,
+}
+
+impl fmt::Debug for ZoneLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ZoneLayout")
+            .field(&self.id)
+            .field(&self.output)
+            .field(&self.start)
+            .field(&self.len)
+            .field(&self.width)
+            .finish()
+    }
+}
 
 struct HoverConfig {
     position: SidebarPosition,
@@ -54,6 +76,7 @@ struct HoverConfig {
 struct Zone {
     // None for the single full-length zone used in `all` mode
     id: Option<u64>,
+    output: Option<String>,
     layer: LayerSurface,
 }
 
@@ -70,8 +93,8 @@ struct Hover {
     cfg: HoverConfig,
     pointer: Option<wl_pointer::WlPointer>,
     zones: Vec<Zone>,
-    // (window id, start, length, visible sliver width) of each sidebar window along the docked edge
-    zone_layout: Vec<(u64, i32, i32, i32)>,
+    // Per-window edge strips, including the output each strip belongs to.
+    zone_layout: Vec<ZoneLayout>,
     overlay: Option<LayerSurface>,
     // Thickness from the docked edge, and the edge span, the pointer may roam without collapsing
     safe_thickness: i32,
@@ -157,7 +180,6 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         .insert(loop_handle.clone())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mode = cfg.mode;
     let mut hover = Hover {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -181,24 +203,16 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         collapse_timer: None,
     };
     hover.refresh_target_output()?;
-
-    match mode {
-        HoverMode::All => {
-            let width = hover.cfg.zone_width;
-            hover.make_zone(None, None, width)
-        }
-        HoverMode::Window => {
-            // Zones follow the sidebar layout, so keep them in sync as windows come and go
-            loop_handle
-                .insert_source(Timer::from_duration(SYNC_INTERVAL), |_, _, hover| {
-                    if let Err(e) = hover.sync_zones() {
-                        eprintln!("niri-sidebar: hover sync failed: {e:#}");
-                    }
-                    TimeoutAction::ToDuration(SYNC_INTERVAL)
-                })
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-    }
+    hover.sync_zones()?;
+    // Zones follow the sidebar layout across all active outputs.
+    loop_handle
+        .insert_source(Timer::from_duration(SYNC_INTERVAL), |_, _, hover| {
+            if let Err(e) = hover.sync_zones() {
+                eprintln!("niri-sidebar: hover sync failed: {e:#}");
+            }
+            TimeoutAction::ToDuration(SYNC_INTERVAL)
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     event_loop.run(None, &mut hover, |_| {})?;
     Ok(())
@@ -237,7 +251,10 @@ impl Hover {
     }
 
     fn target_output(&self) -> Option<wl_output::WlOutput> {
-        let target = self.target_output_name.as_deref()?;
+        self.output_named(self.target_output_name.as_deref()?)
+    }
+
+    fn output_named(&self, target: &str) -> Option<wl_output::WlOutput> {
         self.output_state.outputs().find(|output| {
             self.output_state
                 .info(output)
@@ -248,13 +265,22 @@ impl Hover {
     }
 
     /// Create an edge strip. `span` limits it to part of the edge; None spans the whole edge.
-    fn make_zone(&mut self, id: Option<u64>, span: Option<(i32, i32)>, width: i32) {
+    fn make_zone(
+        &mut self,
+        id: Option<u64>,
+        output_name: Option<&str>,
+        span: Option<(i32, i32)>,
+        width: i32,
+    ) {
+        let output = output_name
+            .and_then(|name| self.output_named(name))
+            .or_else(|| self.target_output());
         let layer = new_layer(
             &self.compositor,
             &self.layer_shell,
             &self.qh,
             "niri-sidebar-hover",
-            self.target_output().as_ref(),
+            output.as_ref(),
         );
         let pos = self.cfg.position;
         let zw = width as u32;
@@ -286,7 +312,11 @@ impl Hover {
             }
         }
         layer.commit();
-        self.zones.push(Zone { id, layer });
+        self.zones.push(Zone {
+            id,
+            output: output_name.map(str::to_string),
+            layer,
+        });
     }
 
     /// Window mode: rebuild the per-window strips whenever the hidden sidebar's layout changes.
@@ -298,30 +328,47 @@ impl Hover {
             return Ok(());
         }
         let mut layout = Vec::new();
-        let mut output_changed = false;
         if state.is_hidden {
             let mut socket = connect()?;
             let all_windows = socket.get_windows()?;
-            let sidebar_ids: Vec<u64> = state.windows.iter().map(|s| s.id).collect();
-            let focused_ws = socket.get_active_workspace()?.id;
-            let ws = sidebar_workspace(&all_windows, &sidebar_ids, focused_ws);
-            let output_name = socket.get_workspace_output(ws)?;
-            output_changed = self.target_output_name.as_ref() != Some(&output_name);
-            self.target_output_name = Some(output_name);
+            let active_workspaces: HashMap<u64, String> = socket
+                .get_workspaces()?
+                .into_iter()
+                .filter(|workspace| workspace.is_active)
+                .filter_map(|workspace| workspace.output.map(|output| (workspace.id, output)))
+                .collect();
             let position = self.cfg.position;
             let vertical = is_vertical_edge(position);
-            let (sw, sh) = socket.get_workspace_dimensions(ws)?;
+            let mut outputs_with_sidebar = Vec::new();
             for w in all_windows {
-                let (Some(pos), true) = (
-                    w.layout.tile_pos_in_workspace_view,
-                    // A focused window is already shown; a strip over it would block its input
-                    w.is_floating
-                        && !w.is_focused
-                        && w.workspace_id == Some(ws)
-                        && state.windows.iter().any(|s| s.id == w.id),
-                ) else {
+                let Some(workspace_id) = w.workspace_id else {
                     continue;
                 };
+                let Some(output_name) = active_workspaces.get(&workspace_id) else {
+                    continue;
+                };
+                let Some(pos) = w.layout.tile_pos_in_workspace_view else {
+                    continue;
+                };
+                if !w.is_floating
+                    || !state
+                        .windows
+                        .iter()
+                        .any(|state_window| state_window.id == w.id)
+                {
+                    continue;
+                }
+                if self.cfg.mode == HoverMode::All {
+                    if !outputs_with_sidebar.contains(output_name) {
+                        outputs_with_sidebar.push(output_name.clone());
+                    }
+                    continue;
+                }
+                // A focused window is already shown; a strip over it would block its input.
+                if w.is_focused {
+                    continue;
+                }
+                let (sw, sh) = socket.get_workspace_dimensions(workspace_id)?;
                 let (tw, th) = w.layout.tile_size;
                 let (start, len) = if vertical { (pos.1, th) } else { (pos.0, tw) };
                 // Niri keeps part of a floating window on screen, so measure the real sliver
@@ -331,23 +378,38 @@ impl Hover {
                     SidebarPosition::Bottom => sh as f64 - pos.1,
                     SidebarPosition::Top => pos.1 + th,
                 };
-                layout.push((
-                    w.id,
-                    start.round() as i32,
-                    len.round() as i32,
-                    (visible.round() as i32).max(1),
-                ));
+                layout.push(ZoneLayout {
+                    id: Some(w.id),
+                    output: output_name.clone(),
+                    start: start.round() as i32,
+                    len: len.round() as i32,
+                    width: (visible.round() as i32).max(1),
+                });
+            }
+            for output in outputs_with_sidebar {
+                layout.push(ZoneLayout {
+                    id: None,
+                    output,
+                    start: 0,
+                    len: 0,
+                    width: self.cfg.zone_width,
+                });
             }
             layout.sort_unstable();
         }
-        if layout == self.zone_layout && !output_changed {
+        if layout == self.zone_layout {
             return Ok(());
         }
         self.overlay = None;
         self.cancel_collapse_timer();
         self.zones.clear();
-        for &(id, start, len, width) in &layout {
-            self.make_zone(Some(id), Some((start, len)), width);
+        for zone in &layout {
+            self.make_zone(
+                zone.id,
+                Some(&zone.output),
+                zone.id.map(|_| (zone.start, zone.len)),
+                zone.width,
+            );
         }
         self.zone_layout = layout;
         if !state.is_hidden && state.revealed.is_some() {
@@ -358,7 +420,7 @@ impl Hover {
         Ok(())
     }
 
-    fn on_zone_enter(&mut self, id: Option<u64>) -> Result<()> {
+    fn on_zone_enter(&mut self, id: Option<u64>, output_name: Option<&str>) -> Result<()> {
         let (mut ctx, _lock) = get_ctx()?;
         if !ctx.state.is_hidden {
             return Ok(());
@@ -408,9 +470,12 @@ impl Hover {
         self.safe_span = id.and_then(|id| {
             self.zone_layout
                 .iter()
-                .find(|z| z.0 == id)
-                .map(|&(_, start, len, _)| (start - SAFE_PAD, len + 2 * SAFE_PAD))
+                .find(|zone| zone.id == Some(id))
+                .map(|zone| (zone.start - SAFE_PAD, zone.len + 2 * SAFE_PAD))
         });
+        if let Some(output_name) = output_name {
+            self.target_output_name = Some(output_name.to_string());
+        }
 
         self.cancel_collapse_timer();
         let layer = new_layer(
@@ -491,8 +556,12 @@ impl Hover {
             h,
         )];
         // Neighbouring strips stay reachable so the reveal can move between windows
-        for &(_, start, len, width) in &self.zone_layout {
-            rects.push(edge_rect(pos, width, (start, len), w, h));
+        for zone in self
+            .zone_layout
+            .iter()
+            .filter(|zone| self.target_output_name.as_deref() == Some(zone.output.as_str()))
+        {
+            rects.push(edge_rect(pos, zone.width, (zone.start, zone.len), w, h));
         }
         rects
     }
@@ -556,18 +625,19 @@ impl PointerHandler for Hover {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let zone_id = self
+            let zone = self
                 .zones
                 .iter()
                 .find(|z| &event.surface == z.layer.wl_surface())
-                .map(|z| z.id);
+                .map(|z| (z.id, z.output.clone()));
             let on_overlay = self
                 .overlay
                 .as_ref()
                 .is_some_and(|o| &event.surface == o.wl_surface());
             match event.kind {
-                PointerEventKind::Enter { .. } if zone_id.is_some() => {
-                    if let Err(e) = self.on_zone_enter(zone_id.flatten()) {
+                PointerEventKind::Enter { .. } if zone.is_some() => {
+                    let (id, output) = zone.expect("zone checked above");
+                    if let Err(e) = self.on_zone_enter(id, output.as_deref()) {
                         eprintln!("niri-sidebar: hover expand failed: {e:#}");
                     }
                 }

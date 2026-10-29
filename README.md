@@ -93,6 +93,12 @@ binds {
 }
 ```
 
+Tracked windows can form independent sidebars on multiple active monitors. Move a
+tracked window with niri's normal workspace or monitor actions (for example,
+`niri msg action move-window-to-monitor DP-2`); it remains tracked and joins the
+sidebar on its destination workspace. Hover zones are created on every active output
+that currently contains tracked sidebar windows.
+
 In order for your sidebar to stay consistent and gap free, you want to add the following to your startup scripts
 
 ```kdl

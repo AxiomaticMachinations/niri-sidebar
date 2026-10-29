@@ -5,6 +5,7 @@ pub use niri_ipc::{Window, Workspace};
 
 pub trait NiriClient {
     fn get_windows(&mut self) -> Result<Vec<Window>>;
+    fn get_workspaces(&mut self) -> Result<Vec<Workspace>>;
     fn get_active_window(&mut self) -> Result<Window>;
     fn get_active_workspace(&mut self) -> Result<Workspace>;
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)>;
@@ -28,6 +29,13 @@ impl NiriClient for Socket {
         }
     }
 
+    fn get_workspaces(&mut self) -> Result<Vec<Workspace>> {
+        match self.send(Request::Workspaces)? {
+            Ok(Response::Workspaces(workspaces)) => Ok(workspaces),
+            _ => bail!("Unexpected response from Niri when fetching workspaces"),
+        }
+    }
+
     fn get_active_window(&mut self) -> Result<Window> {
         match self.send(Request::FocusedWindow)? {
             Ok(Response::FocusedWindow(Some(window))) => Ok(window),
@@ -37,13 +45,10 @@ impl NiriClient for Socket {
     }
 
     fn get_active_workspace(&mut self) -> Result<Workspace> {
-        match self.send(Request::Workspaces)? {
-            Ok(Response::Workspaces(workspaces)) => workspaces
-                .into_iter()
-                .find(|w| w.is_focused)
-                .context("No active workspace found"),
-            _ => bail!("Unexpected response from Niri when fetching workspaces"),
-        }
+        self.get_workspaces()?
+            .into_iter()
+            .find(|w| w.is_focused)
+            .context("No active workspace found")
     }
 
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)> {
@@ -76,14 +81,11 @@ impl NiriClient for Socket {
     }
 
     fn get_workspace_output(&mut self, workspace_id: u64) -> Result<String> {
-        match self.send(Request::Workspaces)? {
-            Ok(Response::Workspaces(workspaces)) => workspaces
-                .into_iter()
-                .find(|w| w.id == workspace_id)
-                .and_then(|w| w.output)
-                .context("Workspace is not on an output"),
-            _ => bail!("Unexpected response from Niri when fetching workspaces"),
-        }
+        self.get_workspaces()?
+            .into_iter()
+            .find(|w| w.id == workspace_id)
+            .and_then(|w| w.output)
+            .context("Workspace is not on an output")
     }
 
     fn send_action(&mut self, action: Action) -> Result<Response> {
