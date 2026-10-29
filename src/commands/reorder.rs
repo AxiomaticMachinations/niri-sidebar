@@ -108,6 +108,10 @@ fn calculate_coordinates<C: NiriClient>(
 }
 
 pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
+    reconcile_positions(ctx).map(|_| ())
+}
+
+pub(crate) fn reconcile_positions<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<bool> {
     let focused_ws = ctx.socket.get_active_workspace()?.id;
     let all_windows = ctx.socket.get_windows()?;
 
@@ -144,6 +148,7 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
     let gap = ctx.config.geometry.gap;
 
     let mut current_stack_offset = 0;
+    let mut changed = false;
 
     for window in sidebar_windows.iter() {
         let dims = resolve_dimensions(window, ctx);
@@ -168,6 +173,21 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
             window_focus_peek,
             ctx,
         );
+        let tile_size = window.layout.tile_size;
+        let clamp_size = (
+            if tile_size.0 > 0.0 {
+                tile_size.0
+            } else {
+                f64::from(dims.width)
+            },
+            if tile_size.1 > 0.0 {
+                tile_size.1
+            } else {
+                f64::from(dims.height)
+            },
+        );
+        let (effective_x, effective_y) =
+            clamp_floating_position((target_x, target_y), (display_w, display_h), clamp_size);
 
         match position {
             SidebarPosition::Left | SidebarPosition::Right => {
@@ -178,14 +198,43 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
             }
         }
 
+        let position_matches = window
+            .layout
+            .tile_pos_in_workspace_view
+            .is_some_and(|(x, y)| {
+                (x - f64::from(effective_x)).abs() < 0.5 && (y - f64::from(effective_y)).abs() < 0.5
+            });
+        if position_matches {
+            continue;
+        }
+
         let _ = ctx.socket.send_action(Action::MoveFloatingWindow {
             id: Some(window.id),
             x: PositionChange::SetFixed(target_x.into()),
             y: PositionChange::SetFixed(target_y.into()),
         });
+        changed = true;
     }
 
-    Ok(())
+    Ok(changed)
+}
+
+fn clamp_floating_position(
+    (x, y): (i32, i32),
+    (display_w, display_h): (i32, i32),
+    (tile_w, tile_h): (f64, f64),
+) -> (i32, i32) {
+    let min_visible_x = (tile_w / 4.0).clamp(10.0, 75.0);
+    let min_visible_y = (tile_h / 4.0).clamp(10.0, 75.0);
+    let min_x = -tile_w + min_visible_x;
+    let max_x = f64::from(display_w) - min_visible_x;
+    let min_y = -tile_h + min_visible_y;
+    let max_y = f64::from(display_h) - min_visible_y;
+
+    (
+        f64::from(x).clamp(min_x, max_x).round() as i32,
+        f64::from(y).clamp(min_y, max_y).round() as i32,
+    )
 }
 
 #[cfg(test)]
@@ -314,6 +363,34 @@ mod tests {
             Action::MoveFloatingWindow { id: Some(1), x: PositionChange::SetFixed(x), .. }
             if *x == 1870.0
         )));
+    }
+
+    #[test]
+    fn test_reorder_skips_position_already_clamped_by_niri() {
+        let temp_dir = tempdir().unwrap();
+        let window = mock_window(1, false, true, 1, Some((1845.0, 830.0)));
+        let mock = MockNiri::new(vec![window]);
+        let mut state = AppState {
+            is_hidden: true,
+            ..Default::default()
+        };
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: true,
+            position: Some((1845.0, 830.0)),
+        });
+        let mut ctx = Ctx {
+            state,
+            config: mock_config(),
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        assert!(ctx.socket.sent_actions.is_empty());
     }
 
     #[test]

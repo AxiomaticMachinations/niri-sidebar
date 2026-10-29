@@ -1,35 +1,97 @@
 use crate::commands::movefrom::move_to;
-use crate::commands::reorder;
+use crate::commands::reorder::reconcile_positions;
+#[cfg(test)]
+use crate::commands::reorder::reorder;
 use crate::commands::togglewindow::add_to_sidebar;
 use crate::config::load_config;
 use crate::niri::connect;
 use crate::state::{get_default_cache_dir, load_state, save_state};
 use crate::window_rules::resolve_auto_add;
 use crate::{Ctx, NiriClient};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use fslock::LockFile;
 use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Request, Window};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
-pub fn listen(mut ctx: Ctx<Socket>) -> Result<()> {
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
+const HEALTH_CHECK: Duration = Duration::from_secs(1);
+const VERIFY_DELAY: Duration = Duration::from_millis(100);
+const VERIFY_ATTEMPTS: usize = 3;
+
+pub fn listen(ctx: Ctx<Socket>) -> Result<()> {
     if ctx.config.interaction.hover {
         super::hover::spawn(&ctx.config);
     }
-    let _ = ctx.socket.send(Request::EventStream)?;
-    let mut read_event = ctx.socket.read_events();
+
+    let (tx, rx) = mpsc::channel();
+    let mut initial_socket = Some(ctx.socket);
+    std::thread::spawn(move || {
+        loop {
+            let mut event_socket = match initial_socket.take() {
+                Some(socket) => socket,
+                None => match connect() {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        eprintln!(
+                            "niri-sidebar: event stream reconnect failed: {error:#}; retrying"
+                        );
+                        std::thread::sleep(HEALTH_CHECK);
+                        continue;
+                    }
+                },
+            };
+            if let Err(error) = event_socket.send(Request::EventStream) {
+                eprintln!("niri-sidebar: event stream setup failed: {error:#}; retrying");
+                std::thread::sleep(HEALTH_CHECK);
+                continue;
+            }
+            let mut read_event = event_socket.read_events();
+            loop {
+                match read_event() {
+                    Ok(event) => {
+                        if tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("niri-sidebar: event stream failed: {error:#}; reconnecting");
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(HEALTH_CHECK);
+        }
+    });
+
     println!("niri-sidebar: Listening for window events...");
 
-    while let Ok(event) = read_event() {
-        match event {
-            Event::WindowClosed { id } => handle_close_event(id)?,
-            Event::WindowFocusChanged { .. } => handle_focus_change()?,
-            Event::WorkspaceActivated { id, focused: true } => handle_workspace_focus(id)?,
-            Event::WindowOpenedOrChanged { window } => handle_new_window(&window)?,
-            _ => {}
+    loop {
+        match rx.recv_timeout(HEALTH_CHECK) {
+            Ok(event) => {
+                let mut events = vec![event];
+                loop {
+                    match rx.recv_timeout(EVENT_DEBOUNCE) {
+                        Ok(event) => events.push(event),
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            bail!("niri event stream disconnected")
+                        }
+                    }
+                }
+                if let Err(error) = process_event_batch(events) {
+                    eprintln!("niri-sidebar: reconcile after event failed: {error:#}; retrying");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Err(error) = reconcile() {
+                    eprintln!("niri-sidebar: periodic reconcile failed: {error:#}; retrying");
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => bail!("niri event stream disconnected"),
         }
     }
-
-    Ok(())
 }
 
 pub(crate) fn get_ctx() -> Result<(Ctx<Socket>, LockFile)> {
@@ -51,47 +113,69 @@ pub(crate) fn get_ctx() -> Result<(Ctx<Socket>, LockFile)> {
     Ok((ctx, lock_file))
 }
 
-fn handle_close_event(closed_id: u64) -> Result<()> {
+fn process_event_batch(events: Vec<Event>) -> Result<()> {
     let (mut ctx, _lock) = get_ctx()?;
-    process_close(&mut ctx, closed_id)
-}
+    let mut dirty = false;
 
-fn handle_focus_change() -> Result<()> {
-    let (mut ctx, _lock) = get_ctx()?;
-    process_focus(&mut ctx)
-}
-
-fn handle_workspace_focus(ws_id: u64) -> Result<()> {
-    let (mut ctx, _lock) = get_ctx()?;
-    if ctx.config.interaction.sticky {
-        process_move(&mut ctx, ws_id)
-    } else {
-        Ok(())
+    for event in events {
+        match event {
+            Event::WindowClosed { id } => dirty |= update_closed_window(&mut ctx, id)?,
+            Event::WindowFocusChanged { .. } => dirty = true,
+            Event::WorkspaceActivated { id, focused: true } => {
+                if ctx.config.interaction.sticky {
+                    process_move(&mut ctx, id)?;
+                }
+                dirty = true;
+            }
+            Event::WindowOpenedOrChanged { window } => {
+                update_new_window(&mut ctx, &window)?;
+                dirty = true;
+            }
+            _ => {}
+        }
     }
+
+    if dirty {
+        reconcile_ctx(&mut ctx)?;
+    }
+    Ok(())
 }
 
-fn handle_new_window(window: &Window) -> Result<()> {
+fn reconcile() -> Result<()> {
     let (mut ctx, _lock) = get_ctx()?;
-    process_new_window(&mut ctx, window)
+    reconcile_ctx(&mut ctx)
 }
 
+fn reconcile_ctx<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
+    for attempt in 0..VERIFY_ATTEMPTS {
+        if !reconcile_positions(ctx)? {
+            return Ok(());
+        }
+        if attempt + 1 < VERIFY_ATTEMPTS {
+            std::thread::sleep(VERIFY_DELAY);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn process_close<C: NiriClient>(ctx: &mut Ctx<C>, closed_id: u64) -> Result<()> {
+    if update_closed_window(ctx, closed_id)? {
+        reorder(ctx)?;
+    }
+    Ok(())
+}
+
+fn update_closed_window<C: NiriClient>(ctx: &mut Ctx<C>, closed_id: u64) -> Result<bool> {
     if let Some(index) = ctx.state.windows.iter().position(|w| w.id == closed_id) {
         println!("Sidebar window {} closed. Reordering...", closed_id);
 
         ctx.state.windows.remove(index);
         save_state(&ctx.state, &ctx.cache_dir)?;
         dbg!(&ctx.state);
-
-        reorder(ctx)?;
+        return Ok(true);
     }
-
-    Ok(())
-}
-
-pub fn process_focus<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
-    reorder(ctx)?;
-    Ok(())
+    Ok(false)
 }
 
 pub fn process_move<C: NiriClient>(ctx: &mut Ctx<C>, ws_id: u64) -> Result<()> {
@@ -104,7 +188,15 @@ pub fn process_move<C: NiriClient>(ctx: &mut Ctx<C>, ws_id: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn process_new_window<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Result<()> {
+    if update_new_window(ctx, window)? {
+        reorder(ctx)?;
+    }
+    Ok(())
+}
+
+fn update_new_window<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Result<bool> {
     // If window is removed from sidebar a WindowOpenedOrChanged event will happen
     // and this if let will catch that and remove id from vector, prevents auto_add
     // from being triggered immediately after window is removed from sidebar
@@ -115,7 +207,8 @@ pub fn process_new_window<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> R
         .position(|id| id == &window.id)
     {
         ctx.state.ignored_windows.remove(index);
-        return Ok(());
+        save_state(&ctx.state, &ctx.cache_dir)?;
+        return Ok(false);
     }
 
     if resolve_auto_add(&ctx.config.window_rule, window)
@@ -123,10 +216,10 @@ pub fn process_new_window<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> R
     {
         add_to_sidebar(ctx, window)?;
         save_state(&ctx.state, &ctx.cache_dir)?;
-        reorder(ctx)?;
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
