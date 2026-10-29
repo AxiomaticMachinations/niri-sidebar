@@ -66,6 +66,10 @@ pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resul
         // niri can drop the first height request on a window that was just floated
         for delay_ms in [150, 450] {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let _ = ctx.socket.send_action(Action::SetWindowWidth {
+                change: SizeChange::SetFixed(target_width),
+                id: Some(window.id),
+            });
             let _ = ctx.socket.send_action(Action::SetWindowHeight {
                 change: SizeChange::SetFixed(target_height),
                 id: Some(window.id),
