@@ -52,6 +52,10 @@ impl NiriClient for MockNiri {
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)> {
         Ok((1920, 1080))
     }
+
+    fn get_workspace_output(&mut self, _workspace_id: u64) -> Result<String> {
+        Ok("eDP-1".into())
+    }
 }
 
 pub fn mock_window(

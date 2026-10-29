@@ -77,6 +77,7 @@ struct Hover {
     // Thickness from the docked edge, and the edge span, the pointer may roam without collapsing
     safe_thickness: i32,
     safe_span: Option<(i32, i32)>,
+    target_output_name: Option<String>,
     overlay_size: (i32, i32),
     overlay_motion_seen: bool,
     collapse_timer: Option<RegistrationToken>,
@@ -176,10 +177,12 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         overlay: None,
         safe_thickness: fallback_thickness,
         safe_span: None,
+        target_output_name: None,
         overlay_size: (0, 0),
         overlay_motion_seen: false,
         collapse_timer: None,
     };
+    hover.refresh_target_output()?;
 
     match mode {
         HoverMode::All => {
@@ -208,6 +211,7 @@ fn new_layer(
     layer_shell: &LayerShell,
     qh: &QueueHandle<Hover>,
     namespace: &str,
+    output: Option<&wl_output::WlOutput>,
 ) -> LayerSurface {
     let surface = compositor.create_surface(qh);
     let layer = layer_shell.create_layer_surface(
@@ -215,7 +219,7 @@ fn new_layer(
         surface,
         Layer::Overlay,
         Some(namespace.to_string()),
-        None,
+        output,
     );
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_exclusive_zone(-1);
@@ -223,6 +227,28 @@ fn new_layer(
 }
 
 impl Hover {
+    fn refresh_target_output(&mut self) -> Result<()> {
+        let state = load_state(&get_default_cache_dir()?)?;
+        let mut socket = connect()?;
+        let windows = socket.get_windows()?;
+        let sidebar_ids: Vec<u64> = state.windows.iter().map(|w| w.id).collect();
+        let focused_ws = socket.get_active_workspace()?.id;
+        let ws = sidebar_workspace(&windows, &sidebar_ids, focused_ws);
+        self.target_output_name = Some(socket.get_workspace_output(ws)?);
+        Ok(())
+    }
+
+    fn target_output(&self) -> Option<wl_output::WlOutput> {
+        let target = self.target_output_name.as_deref()?;
+        self.output_state.outputs().find(|output| {
+            self.output_state
+                .info(output)
+                .and_then(|info| info.name)
+                .as_deref()
+                == Some(target)
+        })
+    }
+
     /// Create an edge strip. `span` limits it to part of the edge; None spans the whole edge.
     fn make_zone(&mut self, id: Option<u64>, span: Option<(i32, i32)>, width: i32) {
         let layer = new_layer(
@@ -230,6 +256,7 @@ impl Hover {
             &self.layer_shell,
             &self.qh,
             "niri-sidebar-hover",
+            self.target_output().as_ref(),
         );
         let pos = self.cfg.position;
         let zw = width as u32;
@@ -273,12 +300,16 @@ impl Hover {
             return Ok(());
         }
         let mut layout = Vec::new();
+        let mut output_changed = false;
         if state.is_hidden {
             let mut socket = connect()?;
             let all_windows = socket.get_windows()?;
             let sidebar_ids: Vec<u64> = state.windows.iter().map(|s| s.id).collect();
             let focused_ws = socket.get_active_workspace()?.id;
             let ws = sidebar_workspace(&all_windows, &sidebar_ids, focused_ws);
+            let output_name = socket.get_workspace_output(ws)?;
+            output_changed = self.target_output_name.as_ref() != Some(&output_name);
+            self.target_output_name = Some(output_name);
             let position = self.cfg.position;
             let vertical = is_vertical_edge(position);
             let (sw, sh) = socket.get_workspace_dimensions(ws)?;
@@ -311,7 +342,7 @@ impl Hover {
             }
             layout.sort_unstable();
         }
-        if layout == self.zone_layout {
+        if layout == self.zone_layout && !output_changed {
             return Ok(());
         }
         self.overlay = None;
@@ -389,6 +420,7 @@ impl Hover {
             &self.layer_shell,
             &self.qh,
             "niri-sidebar-hover-overlay",
+            self.target_output().as_ref(),
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_size(0, 0);

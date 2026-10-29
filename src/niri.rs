@@ -8,6 +8,7 @@ pub trait NiriClient {
     fn get_active_window(&mut self) -> Result<Window>;
     fn get_active_workspace(&mut self) -> Result<Workspace>;
     fn get_screen_dimensions(&mut self) -> Result<(i32, i32)>;
+    fn get_workspace_output(&mut self, workspace_id: u64) -> Result<String>;
     /// Logical size of the output a workspace is on.
     fn get_workspace_dimensions(&mut self, _workspace_id: u64) -> Result<(i32, i32)> {
         self.get_screen_dimensions()
@@ -51,14 +52,7 @@ impl NiriClient for Socket {
     }
 
     fn get_workspace_dimensions(&mut self, workspace_id: u64) -> Result<(i32, i32)> {
-        let target_output_name = match self.send(Request::Workspaces)? {
-            Ok(Response::Workspaces(workspaces)) => workspaces
-                .into_iter()
-                .find(|w| w.id == workspace_id)
-                .and_then(|w| w.output)
-                .context("Workspace is not on an output")?,
-            _ => bail!("Unexpected response from Niri when fetching workspaces"),
-        };
+        let target_output_name = self.get_workspace_output(workspace_id)?;
 
         match self.send(Request::Outputs)? {
             Ok(Response::Outputs(outputs)) => {
@@ -78,6 +72,17 @@ impl NiriClient for Socket {
                 ))
             }
             _ => bail!("Unexpected response from Niri when fetching outputs"),
+        }
+    }
+
+    fn get_workspace_output(&mut self, workspace_id: u64) -> Result<String> {
+        match self.send(Request::Workspaces)? {
+            Ok(Response::Workspaces(workspaces)) => workspaces
+                .into_iter()
+                .find(|w| w.id == workspace_id)
+                .and_then(|w| w.output)
+                .context("Workspace is not on an output"),
+            _ => bail!("Unexpected response from Niri when fetching workspaces"),
         }
     }
 
