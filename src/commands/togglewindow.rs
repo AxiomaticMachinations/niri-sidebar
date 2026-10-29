@@ -23,6 +23,66 @@ pub fn toggle_window<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
     Ok(())
 }
 
+enum Height {
+    Fixed(i32),
+    Auto,
+}
+
+fn send_size<C: NiriClient>(ctx: &mut Ctx<C>, id: u64, width: i32, height: &Height) {
+    let _ = ctx.socket.send_action(Action::SetWindowWidth {
+        change: SizeChange::SetFixed(width),
+        id: Some(id),
+    });
+    let _ = match height {
+        Height::Fixed(h) => ctx.socket.send_action(Action::SetWindowHeight {
+            change: SizeChange::SetFixed(*h),
+            id: Some(id),
+        }),
+        Height::Auto => ctx
+            .socket
+            .send_action(Action::ResetWindowHeight { id: Some(id) }),
+    };
+}
+
+/// Sets a window's size. niri can drop size requests sent right after a window
+/// changes between floating and tiled, so when `verify` is set the size is re-sent
+/// until the window reports it (or stops changing, e.g. at an app's minimum size).
+fn apply_size<C: NiriClient>(ctx: &mut Ctx<C>, id: u64, width: i32, height: Height, verify: bool) {
+    send_size(ctx, id, width, &height);
+    if !verify {
+        return;
+    }
+
+    let mut last = None;
+    let mut stable = 0;
+    for attempt in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let Some(size) = ctx
+            .socket
+            .get_windows()
+            .ok()
+            .and_then(|ws| ws.into_iter().find(|w| w.id == id))
+            .map(|w| w.layout.window_size)
+        else {
+            return;
+        };
+        let width_ok = size.0 == width;
+        let height_ok = match height {
+            Height::Fixed(h) => size.1 == h,
+            Height::Auto => attempt >= 1,
+        };
+        if width_ok && height_ok {
+            return;
+        }
+        stable = if last == Some(size) { stable + 1 } else { 0 };
+        last = Some(size);
+        if width_ok && stable >= 2 {
+            return;
+        }
+        send_size(ctx, id, width, &height);
+    }
+}
+
 pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Result<()> {
     let (width, height) = window.layout.window_size;
     let w_state = WindowState {
@@ -52,30 +112,13 @@ pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resul
         ctx.config.geometry.height,
     );
 
-    let _ = ctx.socket.send_action(Action::SetWindowWidth {
-        change: SizeChange::SetFixed(target_width),
-        id: Some(window.id),
-    });
-
-    let _ = ctx.socket.send_action(Action::SetWindowHeight {
-        change: SizeChange::SetFixed(target_height),
-        id: Some(window.id),
-    });
-
-    if !window.is_floating {
-        // niri can drop the first height request on a window that was just floated
-        for delay_ms in [150, 450] {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            let _ = ctx.socket.send_action(Action::SetWindowWidth {
-                change: SizeChange::SetFixed(target_width),
-                id: Some(window.id),
-            });
-            let _ = ctx.socket.send_action(Action::SetWindowHeight {
-                change: SizeChange::SetFixed(target_height),
-                id: Some(window.id),
-            });
-        }
-    }
+    apply_size(
+        ctx,
+        window.id,
+        target_width,
+        Height::Fixed(target_height),
+        !window.is_floating,
+    );
 
     Ok(())
 }
@@ -95,29 +138,16 @@ fn remove_from_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resu
         let _ = ctx.socket.send_action(Action::ToggleWindowFloating {
             id: Some(window.id),
         });
-        // Sizes sent while floating don't carry over to the tiled layout, and a
-        // tiled window's height is automatic (fills the column), so reset it.
-        for (i, delay_ms) in [150, 450].into_iter().enumerate() {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            if i == 0 {
-                let _ = ctx.socket.send_action(Action::SetWindowWidth {
-                    change: SizeChange::SetFixed(w_state.width),
-                    id: Some(window.id),
-                });
-            }
-            let _ = ctx.socket.send_action(Action::ResetWindowHeight {
-                id: Some(window.id),
-            });
-        }
+        // A tiled window's height is automatic (it fills the column), not a fixed size.
+        apply_size(ctx, window.id, w_state.width, Height::Auto, true);
     } else {
-        let _ = ctx.socket.send_action(Action::SetWindowWidth {
-            change: SizeChange::SetFixed(w_state.width),
-            id: Some(window.id),
-        });
-        let _ = ctx.socket.send_action(Action::SetWindowHeight {
-            change: SizeChange::SetFixed(w_state.height),
-            id: Some(window.id),
-        });
+        apply_size(
+            ctx,
+            window.id,
+            w_state.width,
+            Height::Fixed(w_state.height),
+            false,
+        );
     }
 
     if let Some((x, y)) = w_state.position
