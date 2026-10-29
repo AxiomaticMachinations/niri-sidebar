@@ -78,6 +78,7 @@ struct Hover {
     safe_thickness: i32,
     safe_span: Option<(i32, i32)>,
     overlay_size: (i32, i32),
+    overlay_motion_seen: bool,
     collapse_timer: Option<RegistrationToken>,
 }
 
@@ -176,6 +177,7 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         safe_thickness: fallback_thickness,
         safe_span: None,
         overlay_size: (0, 0),
+        overlay_motion_seen: false,
         collapse_timer: None,
     };
 
@@ -539,9 +541,19 @@ impl PointerHandler for Hover {
                         eprintln!("niri-sidebar: hover expand failed: {e:#}");
                     }
                 }
-                PointerEventKind::Enter { .. } if on_overlay => self.start_collapse_timer(),
+                PointerEventKind::Enter { .. } if on_overlay => {
+                    self.overlay_motion_seen = false;
+                    self.start_collapse_timer();
+                }
+                PointerEventKind::Motion { .. } if on_overlay => {
+                    self.overlay_motion_seen = true;
+                }
                 PointerEventKind::Leave { .. }
-                    if on_overlay && self.overlay_leave_returns_to_safe_area(event.position) =>
+                    if on_overlay
+                        && overlay_leave_cancels(
+                            self.overlay_motion_seen,
+                            self.overlay_leave_returns_to_safe_area(event.position),
+                        ) =>
                 {
                     self.cancel_collapse_timer()
                 }
@@ -550,6 +562,10 @@ impl PointerHandler for Hover {
             }
         }
     }
+}
+
+fn overlay_leave_cancels(motion_seen: bool, enters_safe_area: bool) -> bool {
+    motion_seen && enters_safe_area
 }
 
 fn leave_enters_safe_area(
@@ -736,5 +752,8 @@ mod tests {
             1018,
             span,
         ));
+        assert!(overlay_leave_cancels(true, true));
+        assert!(!overlay_leave_cancels(false, true));
+        assert!(!overlay_leave_cancels(true, false));
     }
 }
