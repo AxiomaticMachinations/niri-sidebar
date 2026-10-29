@@ -12,6 +12,9 @@ pub struct AppState {
     pub is_hidden: bool,
     #[serde(default)]
     pub is_flipped: bool,
+    // Window revealed by hovering its edge strip while the sidebar is hidden
+    #[serde(default)]
+    pub revealed: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -80,6 +83,7 @@ mod tests {
             ignored_windows: vec![100, 200],
             is_hidden: true,
             is_flipped: true,
+            revealed: Some(100),
         };
 
         save_state(&original_state, temp_dir.path()).expect("Failed to save state");

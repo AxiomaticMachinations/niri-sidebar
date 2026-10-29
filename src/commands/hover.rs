@@ -1,7 +1,10 @@
 use super::hide::toggle_visibility;
 use super::listen::get_ctx;
+use super::reorder::reorder;
 use crate::NiriClient;
-use crate::config::{Config, SidebarPosition};
+use crate::config::{Config, HoverMode, SidebarPosition};
+use crate::niri::connect;
+use crate::state::{get_default_cache_dir, load_state, save_state};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
@@ -38,11 +41,21 @@ use std::time::Duration;
 
 // Extra room around the sidebar so grazing its edge doesn't trigger a collapse
 const SAFE_PAD: i32 = 8;
+const SYNC_INTERVAL: Duration = Duration::from_millis(500);
+
+type Rect = (i32, i32, i32, i32);
 
 struct HoverConfig {
     position: SidebarPosition,
+    mode: HoverMode,
     zone_width: i32,
     collapse_delay: Duration,
+}
+
+struct Zone {
+    // None for the single full-length zone used in `all` mode
+    id: Option<u64>,
+    layer: LayerSurface,
 }
 
 struct Hover {
@@ -54,18 +67,23 @@ struct Hover {
     layer_shell: LayerShell,
     pool: SlotPool,
     loop_handle: LoopHandle<'static, Hover>,
+    qh: QueueHandle<Hover>,
     cfg: HoverConfig,
     pointer: Option<wl_pointer::WlPointer>,
-    hot_zone: LayerSurface,
+    zones: Vec<Zone>,
+    // (window id, start, length, visible sliver width) of each sidebar window along the docked edge
+    zone_layout: Vec<(u64, i32, i32, i32)>,
     overlay: Option<LayerSurface>,
-    // Thickness of the area (measured from the docked edge) the pointer may roam without collapsing
+    // Thickness from the docked edge, and the edge span, the pointer may roam without collapsing
     safe_thickness: i32,
+    safe_span: Option<(i32, i32)>,
     collapse_timer: Option<RegistrationToken>,
 }
 
 pub fn spawn(config: &Config) {
     let cfg = HoverConfig {
         position: config.interaction.position,
+        mode: config.interaction.hover_mode,
         zone_width: config
             .interaction
             .hover_zone_width
@@ -73,8 +91,7 @@ pub fn spawn(config: &Config) {
             .max(1),
         collapse_delay: Duration::from_millis(config.interaction.hover_collapse_delay_ms),
     };
-    let margin = side_margin(config);
-    let fallback = fallback_thickness(config) + margin + SAFE_PAD;
+    let fallback = fallback_thickness(config) + side_margin(config) + SAFE_PAD;
     std::thread::spawn(move || {
         if let Err(e) = run(cfg, fallback) {
             eprintln!("niri-sidebar: hover disabled: {e:#}");
@@ -105,20 +122,21 @@ fn is_vertical_edge(position: SidebarPosition) -> bool {
 
 fn edge_anchor(position: SidebarPosition) -> Anchor {
     match position {
-        SidebarPosition::Right => Anchor::TOP | Anchor::BOTTOM | Anchor::RIGHT,
-        SidebarPosition::Left => Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT,
-        SidebarPosition::Top => Anchor::LEFT | Anchor::RIGHT | Anchor::TOP,
-        SidebarPosition::Bottom => Anchor::LEFT | Anchor::RIGHT | Anchor::BOTTOM,
+        SidebarPosition::Right => Anchor::RIGHT,
+        SidebarPosition::Left => Anchor::LEFT,
+        SidebarPosition::Top => Anchor::TOP,
+        SidebarPosition::Bottom => Anchor::BOTTOM,
     }
 }
 
-/// Input region of the overlay: everything except the band along the docked edge.
-fn outside_rect(position: SidebarPosition, thickness: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+/// Rect `thickness` deep along the docked edge, covering `span` = (start, length) along it.
+fn edge_rect(position: SidebarPosition, thickness: i32, span: (i32, i32), w: i32, h: i32) -> Rect {
+    let (start, len) = span;
     match position {
-        SidebarPosition::Right => (0, 0, (w - thickness).max(0), h),
-        SidebarPosition::Left => (thickness, 0, (w - thickness).max(0), h),
-        SidebarPosition::Bottom => (0, 0, w, (h - thickness).max(0)),
-        SidebarPosition::Top => (0, thickness, w, (h - thickness).max(0)),
+        SidebarPosition::Right => (w - thickness, start, thickness, len),
+        SidebarPosition::Left => (0, start, thickness, len),
+        SidebarPosition::Bottom => (start, h - thickness, len, thickness),
+        SidebarPosition::Top => (start, 0, len, thickness),
     }
 }
 
@@ -138,15 +156,7 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         .insert(loop_handle.clone())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let hot_zone = new_layer(&compositor, &layer_shell, &qh, "niri-sidebar-hover");
-    hot_zone.set_anchor(edge_anchor(cfg.position));
-    if is_vertical_edge(cfg.position) {
-        hot_zone.set_size(cfg.zone_width as u32, 0);
-    } else {
-        hot_zone.set_size(0, cfg.zone_width as u32);
-    }
-    hot_zone.commit();
-
+    let mode = cfg.mode;
     let mut hover = Hover {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -155,14 +165,35 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         compositor,
         layer_shell,
         pool,
-        loop_handle,
+        loop_handle: loop_handle.clone(),
+        qh,
         cfg,
         pointer: None,
-        hot_zone,
+        zones: Vec::new(),
+        zone_layout: Vec::new(),
         overlay: None,
         safe_thickness: fallback_thickness,
+        safe_span: None,
         collapse_timer: None,
     };
+
+    match mode {
+        HoverMode::All => {
+            let width = hover.cfg.zone_width;
+            hover.make_zone(None, None, width)
+        }
+        HoverMode::Window => {
+            // Zones follow the sidebar layout, so keep them in sync as windows come and go
+            loop_handle
+                .insert_source(Timer::from_duration(SYNC_INTERVAL), |_, _, hover| {
+                    if let Err(e) = hover.sync_zones() {
+                        eprintln!("niri-sidebar: hover sync failed: {e:#}");
+                    }
+                    TimeoutAction::ToDuration(SYNC_INTERVAL)
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
 
     event_loop.run(None, &mut hover, |_| {})?;
     Ok(())
@@ -188,48 +219,172 @@ fn new_layer(
 }
 
 impl Hover {
-    fn on_hot_zone_enter(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
+    /// Create an edge strip. `span` limits it to part of the edge; None spans the whole edge.
+    fn make_zone(&mut self, id: Option<u64>, span: Option<(i32, i32)>, width: i32) {
+        let layer = new_layer(
+            &self.compositor,
+            &self.layer_shell,
+            &self.qh,
+            "niri-sidebar-hover",
+        );
+        let pos = self.cfg.position;
+        let zw = width as u32;
+        let vertical = is_vertical_edge(pos);
+        match span {
+            None => {
+                layer.set_anchor(match pos {
+                    SidebarPosition::Right => Anchor::TOP | Anchor::BOTTOM | Anchor::RIGHT,
+                    SidebarPosition::Left => Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT,
+                    SidebarPosition::Top => Anchor::LEFT | Anchor::RIGHT | Anchor::TOP,
+                    SidebarPosition::Bottom => Anchor::LEFT | Anchor::RIGHT | Anchor::BOTTOM,
+                });
+                if vertical {
+                    layer.set_size(zw, 0);
+                } else {
+                    layer.set_size(0, zw);
+                }
+            }
+            Some((start, len)) => {
+                if vertical {
+                    layer.set_anchor(Anchor::TOP | edge_anchor(pos));
+                    layer.set_size(zw, len as u32);
+                    layer.set_margin(start, 0, 0, 0);
+                } else {
+                    layer.set_anchor(Anchor::LEFT | edge_anchor(pos));
+                    layer.set_size(len as u32, zw);
+                    layer.set_margin(0, 0, 0, start);
+                }
+            }
+        }
+        layer.commit();
+        self.zones.push(Zone { id, layer });
+    }
+
+    /// Window mode: rebuild the per-window strips whenever the hidden sidebar's layout changes.
+    fn sync_zones(&mut self) -> Result<()> {
+        let cache_dir = get_default_cache_dir()?;
+        let state = load_state(&cache_dir)?;
+        // Windows move while one is revealed; keep the strips stable until it collapses
+        if state.revealed.is_some() && self.overlay.is_some() {
+            return Ok(());
+        }
+        let mut layout = Vec::new();
+        if state.is_hidden {
+            let mut socket = connect()?;
+            let ws = socket.get_active_workspace()?.id;
+            let position = self.cfg.position;
+            let vertical = is_vertical_edge(position);
+            let (sw, sh) = socket.get_screen_dimensions()?;
+            for w in socket.get_windows()? {
+                let (Some(pos), true) = (
+                    w.layout.tile_pos_in_workspace_view,
+                    w.is_floating
+                        && w.workspace_id == Some(ws)
+                        && state.windows.iter().any(|s| s.id == w.id),
+                ) else {
+                    continue;
+                };
+                let (tw, th) = w.layout.tile_size;
+                let (start, len) = if vertical { (pos.1, th) } else { (pos.0, tw) };
+                // Niri keeps part of a floating window on screen, so measure the real sliver
+                let visible = match position {
+                    SidebarPosition::Right => sw as f64 - pos.0,
+                    SidebarPosition::Left => pos.0 + tw,
+                    SidebarPosition::Bottom => sh as f64 - pos.1,
+                    SidebarPosition::Top => pos.1 + th,
+                };
+                layout.push((
+                    w.id,
+                    start.round() as i32,
+                    len.round() as i32,
+                    (visible.round() as i32).max(1),
+                ));
+            }
+            layout.sort_unstable();
+        }
+        if layout == self.zone_layout {
+            return Ok(());
+        }
+        self.overlay = None;
+        self.cancel_collapse_timer();
+        self.zones.clear();
+        for &(id, start, len, width) in &layout {
+            self.make_zone(Some(id), Some((start, len)), width);
+        }
+        self.zone_layout = layout;
+        if !state.is_hidden && state.revealed.is_some() {
+            let (mut ctx, _lock) = get_ctx()?;
+            ctx.state.revealed = None;
+            save_state(&ctx.state, &ctx.cache_dir)?;
+        }
+        Ok(())
+    }
+
+    fn on_zone_enter(&mut self, id: Option<u64>) -> Result<()> {
         let (mut ctx, _lock) = get_ctx()?;
         if !ctx.state.is_hidden {
             return Ok(());
         }
-        toggle_visibility(&mut ctx)?;
-
-        let ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
         let vertical = is_vertical_edge(self.cfg.position);
-        let size = ctx
-            .socket
-            .get_windows()?
-            .into_iter()
-            .filter(|w| w.is_floating && ids.contains(&w.id))
+        let sidebar_ids: Vec<u64> = ctx.state.windows.iter().map(|w| w.id).collect();
+        let windows = ctx.socket.get_windows()?;
+
+        match id {
+            None => toggle_visibility(&mut ctx)?,
+            Some(id) => {
+                if ctx.state.revealed == Some(id) && self.overlay.is_some() {
+                    return Ok(());
+                }
+                ctx.state.revealed = Some(id);
+                save_state(&ctx.state, &ctx.cache_dir)?;
+                reorder(&mut ctx)?;
+            }
+        }
+
+        // Re-read after the move: sizes along the stacking axis don't change, so this is safe
+        let windows = if id.is_some() {
+            windows
+        } else {
+            ctx.socket.get_windows()?
+        };
+        let size = windows
+            .iter()
+            .filter(|w| w.is_floating && sidebar_ids.contains(&w.id))
+            .filter(|w| id.is_none_or(|id| w.id == id))
             .map(|w| {
                 let (tw, th) = w.layout.tile_size;
                 if vertical { tw } else { th }
             })
             .fold(0.0_f64, f64::max);
-        let margin = side_margin(&ctx.config);
         if size > 0.0 {
+            let margin = side_margin(&ctx.config);
             let size = size.ceil() as i32;
-            let edge_gap = if ctx.config.interaction.get_focus_peek() >= size {
-                ctx.config.interaction.get_focus_peek() - size
+            let focus_peek = ctx.config.interaction.get_focus_peek();
+            let edge_gap = if focus_peek >= size {
+                focus_peek - size
             } else {
                 margin
             };
             self.safe_thickness = size + edge_gap.max(margin) + SAFE_PAD;
         }
+        self.safe_span = id.and_then(|id| {
+            self.zone_layout
+                .iter()
+                .find(|z| z.0 == id)
+                .map(|&(_, start, len, _)| (start - SAFE_PAD, len + 2 * SAFE_PAD))
+        });
 
-        if self.overlay.is_none() {
-            let layer = new_layer(
-                &self.compositor,
-                &self.layer_shell,
-                qh,
-                "niri-sidebar-hover-overlay",
-            );
-            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-            layer.set_size(0, 0);
-            layer.commit();
-            self.overlay = Some(layer);
-        }
+        self.cancel_collapse_timer();
+        let layer = new_layer(
+            &self.compositor,
+            &self.layer_shell,
+            &self.qh,
+            "niri-sidebar-hover-overlay",
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_size(0, 0);
+        layer.commit();
+        self.overlay = Some(layer);
         Ok(())
     }
 
@@ -237,8 +392,18 @@ impl Hover {
         self.collapse_timer = None;
         self.overlay = None;
         let (mut ctx, _lock) = get_ctx()?;
-        if !ctx.state.is_hidden {
-            toggle_visibility(&mut ctx)?;
+        match self.cfg.mode {
+            HoverMode::All => {
+                if !ctx.state.is_hidden {
+                    toggle_visibility(&mut ctx)?;
+                }
+            }
+            HoverMode::Window => {
+                if ctx.state.revealed.take().is_some() {
+                    save_state(&ctx.state, &ctx.cache_dir)?;
+                    reorder(&mut ctx)?;
+                }
+            }
         }
         Ok(())
     }
@@ -263,6 +428,24 @@ impl Hover {
         if let Some(token) = self.collapse_timer.take() {
             self.loop_handle.remove(token);
         }
+    }
+
+    /// Areas of the overlay that must not capture the pointer.
+    fn exclusions(&self, w: i32, h: i32) -> Vec<Rect> {
+        let pos = self.cfg.position;
+        let full = if is_vertical_edge(pos) { h } else { w };
+        let mut rects = vec![edge_rect(
+            pos,
+            self.safe_thickness,
+            self.safe_span.unwrap_or((0, full)),
+            w,
+            h,
+        )];
+        // Neighbouring strips stay reachable so the reveal can move between windows
+        for &(_, start, len, width) in &self.zone_layout {
+            rects.push(edge_rect(pos, width, (start, len), w, h));
+        }
+        rects
     }
 
     fn present_transparent(&mut self, layer: &LayerSurface, w: i32, h: i32) {
@@ -300,9 +483,11 @@ impl LayerShellHandler for Hover {
             return;
         }
         if self.overlay.as_ref().is_some_and(|o| o == layer) {
-            let (x, y, rw, rh) = outside_rect(self.cfg.position, self.safe_thickness, w, h);
             if let Ok(region) = Region::new(&self.compositor) {
-                region.add(x, y, rw, rh);
+                region.add(0, 0, w, h);
+                for (x, y, rw, rh) in self.exclusions(w, h) {
+                    region.subtract(x, y, rw, rh);
+                }
                 layer
                     .wl_surface()
                     .set_input_region(Some(region.wl_region()));
@@ -316,19 +501,23 @@ impl PointerHandler for Hover {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
-            let on_hot_zone = &event.surface == self.hot_zone.wl_surface();
+            let zone_id = self
+                .zones
+                .iter()
+                .find(|z| &event.surface == z.layer.wl_surface())
+                .map(|z| z.id);
             let on_overlay = self
                 .overlay
                 .as_ref()
                 .is_some_and(|o| &event.surface == o.wl_surface());
             match event.kind {
-                PointerEventKind::Enter { .. } if on_hot_zone => {
-                    if let Err(e) = self.on_hot_zone_enter(qh) {
+                PointerEventKind::Enter { .. } if zone_id.is_some() => {
+                    if let Err(e) = self.on_zone_enter(zone_id.flatten()) {
                         eprintln!("niri-sidebar: hover expand failed: {e:#}");
                     }
                 }
@@ -443,22 +632,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outside_rect_excludes_docked_band() {
+    fn edge_rect_hugs_docked_edge() {
+        let span = (40, 100);
         assert_eq!(
-            outside_rect(SidebarPosition::Right, 100, 1000, 500),
-            (0, 0, 900, 500)
+            edge_rect(SidebarPosition::Right, 30, span, 1000, 500),
+            (970, 40, 30, 100)
         );
         assert_eq!(
-            outside_rect(SidebarPosition::Left, 100, 1000, 500),
-            (100, 0, 900, 500)
+            edge_rect(SidebarPosition::Left, 30, span, 1000, 500),
+            (0, 40, 30, 100)
         );
         assert_eq!(
-            outside_rect(SidebarPosition::Bottom, 100, 1000, 500),
-            (0, 0, 1000, 400)
+            edge_rect(SidebarPosition::Bottom, 30, span, 1000, 500),
+            (40, 470, 100, 30)
         );
         assert_eq!(
-            outside_rect(SidebarPosition::Top, 100, 1000, 500),
-            (0, 100, 1000, 400)
+            edge_rect(SidebarPosition::Top, 30, span, 1000, 500),
+            (40, 0, 100, 30)
         );
     }
 }

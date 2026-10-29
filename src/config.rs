@@ -25,6 +25,16 @@ pub enum StackDirection {
     RightToLeft,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HoverMode {
+    /// Hovering the screen edge shows the whole sidebar
+    #[default]
+    All,
+    /// Hovering a window's edge strip reveals only that window
+    Window,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub geometry: Geometry,
@@ -65,6 +75,8 @@ pub struct Interaction {
     pub sticky: bool,
     #[serde(default)]
     pub hover: bool,
+    #[serde(default)]
+    pub hover_mode: HoverMode,
     pub hover_zone_width: Option<i32>,
     #[serde(default = "default_hover_collapse_delay_ms")]
     pub hover_collapse_delay_ms: u64,

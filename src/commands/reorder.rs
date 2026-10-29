@@ -152,7 +152,7 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
             window,
             ctx.config.interaction.get_focus_peek(),
         );
-        let active_peek = if window.is_focused {
+        let active_peek = if window.is_focused || ctx.state.revealed == Some(window.id) {
             window_focus_peek
         } else {
             resolve_rule_peek(&ctx.config.window_rule, window, ctx.config.interaction.peek)
@@ -757,6 +757,46 @@ mod tests {
         // Screen width 1920: 1920 - 310 (focus peek), not 1920 - 300 - 20 (margin)
         assert_eq!(x_for(false, false), 1610.0);
         assert_eq!(x_for(true, true), 1610.0);
+    }
+
+    #[test]
+    fn test_revealed_window_uses_focus_peek_while_hidden() {
+        let temp_dir = tempdir().unwrap();
+        let mock = MockNiri::new(vec![mock_window(1, false, true, 1, Some((1.0, 2.0)))]);
+        let mut config = mock_config();
+        config.interaction.position = SidebarPosition::Right;
+        config.interaction.peek = 10;
+        config.interaction.focus_peek = Some(100);
+        let mut state = AppState {
+            is_hidden: true,
+            revealed: Some(1),
+            ..Default::default()
+        };
+        state.windows.push(WindowState {
+            id: 1,
+            width: 300,
+            height: 200,
+            is_floating: false,
+            position: None,
+        });
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        // Screen width 1920: revealed with focus peek 100, not the 10px peek
+        assert!(ctx.socket.sent_actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(1),
+                x: PositionChange::SetFixed(1820.0),
+                ..
+            }
+        )));
     }
 
     #[test]

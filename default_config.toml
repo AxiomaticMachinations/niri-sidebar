@@ -41,7 +41,11 @@ sticky = false
 # Expand the sidebar when the pointer touches the screen edge it is docked to,
 # and collapse it again once the pointer leaves (requires `niri-sidebar listen`)
 hover = false
-# Width of the screen-edge strip that triggers the expand, in pixels (defaults to `peek`)
+# "all" shows the whole sidebar when the edge is hovered; "window" reveals only the
+# window whose edge strip is hovered (only applies while the sidebar is hidden)
+# hover_mode = "all"
+# Width of the screen-edge strip that triggers the expand in "all" mode, in pixels
+# (defaults to `peek`). In "window" mode each strip covers the part of that window still visible on screen.
 # hover_zone_width = 1
 # How long the pointer must stay outside the sidebar before it collapses, in ms
 hover_collapse_delay_ms = 200

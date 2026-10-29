@@ -62,6 +62,17 @@ pub fn add_to_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resul
         id: Some(window.id),
     });
 
+    if !window.is_floating {
+        // niri can drop the first height request on a window that was just floated
+        for delay_ms in [150, 450] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let _ = ctx.socket.send_action(Action::SetWindowHeight {
+                change: SizeChange::SetFixed(target_height),
+                id: Some(window.id),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -76,18 +87,29 @@ fn remove_from_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resu
     let w_state = ctx.state.windows.remove(index);
     ctx.state.ignored_windows.push(w_state.id);
 
-    let _ = ctx.socket.send_action(Action::SetWindowWidth {
-        change: SizeChange::SetFixed(w_state.width),
-        id: Some(window.id),
-    });
-
-    let _ = ctx.socket.send_action(Action::SetWindowHeight {
-        change: SizeChange::SetFixed(w_state.height),
-        id: Some(window.id),
-    });
-
     if window.is_floating && !w_state.is_floating {
         let _ = ctx.socket.send_action(Action::ToggleWindowFloating {
+            id: Some(window.id),
+        });
+        // Sizes sent while floating don't carry over to the tiled layout, and a
+        // tiled window's height is automatic (fills the column), so reset it.
+        for delay_ms in [150, 450] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let _ = ctx.socket.send_action(Action::SetWindowWidth {
+                change: SizeChange::SetFixed(w_state.width),
+                id: Some(window.id),
+            });
+            let _ = ctx.socket.send_action(Action::ResetWindowHeight {
+                id: Some(window.id),
+            });
+        }
+    } else {
+        let _ = ctx.socket.send_action(Action::SetWindowWidth {
+            change: SizeChange::SetFixed(w_state.width),
+            id: Some(window.id),
+        });
+        let _ = ctx.socket.send_action(Action::SetWindowHeight {
+            change: SizeChange::SetFixed(w_state.height),
             id: Some(window.id),
         });
     }

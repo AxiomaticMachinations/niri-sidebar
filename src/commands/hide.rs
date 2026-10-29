@@ -6,6 +6,7 @@ use anyhow::Result;
 
 pub fn toggle_visibility<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
     ctx.state.is_hidden = !ctx.state.is_hidden;
+    ctx.state.revealed = None;
     save_state(&ctx.state, &ctx.cache_dir)?;
     reorder(ctx)?;
     Ok(())
