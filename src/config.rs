@@ -78,8 +78,6 @@ pub struct Interaction {
     #[serde(default)]
     pub hover_mode: HoverMode,
     pub hover_zone_width: Option<i32>,
-    #[serde(default = "default_hover_collapse_delay_ms")]
-    pub hover_collapse_delay_ms: u64,
 }
 
 impl Interaction {
@@ -111,10 +109,6 @@ impl Interaction {
 
 fn default_sticky() -> bool {
     false
-}
-
-fn default_hover_collapse_delay_ms() -> u64 {
-    200
 }
 
 fn default_stack_direction() -> StackDirection {

@@ -49,7 +49,6 @@ struct HoverConfig {
     position: SidebarPosition,
     mode: HoverMode,
     zone_width: i32,
-    collapse_delay: Duration,
 }
 
 struct Zone {
@@ -92,7 +91,6 @@ pub fn spawn(config: &Config) {
             .hover_zone_width
             .unwrap_or(config.interaction.peek)
             .max(1),
-        collapse_delay: Duration::from_millis(config.interaction.hover_collapse_delay_ms),
     };
     let fallback = fallback_thickness(config) + side_margin(config) + SAFE_PAD;
     std::thread::spawn(move || {
@@ -453,7 +451,7 @@ impl Hover {
         if self.collapse_timer.is_some() {
             return;
         }
-        let timer = Timer::from_duration(self.cfg.collapse_delay);
+        let timer = Timer::from_duration(Duration::ZERO);
         self.collapse_timer = self
             .loop_handle
             .insert_source(timer, |_, _, hover| {
