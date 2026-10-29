@@ -15,7 +15,12 @@ fn resolve_dimensions<C: NiriClient>(window: &Window, ctx: &Ctx<C>) -> WindowTar
         ctx.config.geometry.height,
     );
 
-    WindowTarget { width, height }
+    // Apps with a minimum size ignore smaller targets, so stack by the size they actually have
+    let (actual_width, actual_height) = window.layout.window_size;
+    WindowTarget {
+        width: width.max(actual_width),
+        height: height.max(actual_height),
+    }
 }
 
 fn calculate_coordinates<C: NiriClient>(
@@ -24,6 +29,7 @@ fn calculate_coordinates<C: NiriClient>(
     screen: (i32, i32),
     stack_offset: i32,
     active_peek: i32,
+    focus_peek: i32,
     ctx: &Ctx<C>,
 ) -> (i32, i32) {
     let state = &ctx.state;
@@ -31,10 +37,19 @@ fn calculate_coordinates<C: NiriClient>(
     let (sw, sh) = screen;
     let (w, h) = (dims.width, dims.height);
     let stack_direction = ctx.config.interaction.get_stack_direction();
+    // A focus peek as wide as the window reveals it fully; use that same gap when shown so
+    // the focused-hidden and shown positions coincide. Otherwise fall back to the margin.
+    let edge_offset = |size: i32, margin: i32| {
+        if focus_peek >= size {
+            focus_peek - size
+        } else {
+            margin
+        }
+    };
 
     match pos {
         SidebarPosition::Right => {
-            let visible_x = sw - w - margins.right;
+            let visible_x = sw - w - edge_offset(w, margins.right);
             let hidden_x = sw - active_peek;
             let x = if state.is_hidden { hidden_x } else { visible_x };
 
@@ -48,7 +63,7 @@ fn calculate_coordinates<C: NiriClient>(
             (x, y)
         }
         SidebarPosition::Left => {
-            let visible_x = margins.left;
+            let visible_x = edge_offset(w, margins.left);
             let hidden_x = -w + active_peek;
             let x = if state.is_hidden { hidden_x } else { visible_x };
 
@@ -70,7 +85,7 @@ fn calculate_coordinates<C: NiriClient>(
                 ),
             };
 
-            let visible_y = sh - h - margins.bottom;
+            let visible_y = sh - h - edge_offset(h, margins.bottom);
             let hidden_y = sh - active_peek;
             let y = if state.is_hidden { hidden_y } else { visible_y };
             (x, y)
@@ -84,7 +99,7 @@ fn calculate_coordinates<C: NiriClient>(
                 ),
             };
 
-            let visible_y = margins.top;
+            let visible_y = edge_offset(h, margins.top);
             let hidden_y = -h + active_peek;
             let y = if state.is_hidden { hidden_y } else { visible_y };
             (x, y)
@@ -132,12 +147,13 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
     for window in sidebar_windows.iter() {
         let dims = resolve_dimensions(window, ctx);
 
+        let window_focus_peek = resolve_rule_focus_peek(
+            &ctx.config.window_rule,
+            window,
+            ctx.config.interaction.get_focus_peek(),
+        );
         let active_peek = if window.is_focused {
-            resolve_rule_focus_peek(
-                &ctx.config.window_rule,
-                window,
-                ctx.config.interaction.get_focus_peek(),
-            )
+            window_focus_peek
         } else {
             resolve_rule_peek(&ctx.config.window_rule, window, ctx.config.interaction.peek)
         };
@@ -148,6 +164,7 @@ pub fn reorder<C: NiriClient>(ctx: &mut Ctx<C>) -> Result<()> {
             (display_w, display_h),
             current_stack_offset,
             active_peek,
+            window_focus_peek,
             ctx,
         );
 
@@ -655,6 +672,91 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn test_stacking_uses_actual_size_when_window_enforces_minimum() {
+        let temp_dir = tempdir().unwrap();
+        let mut w1 = mock_window(1, false, true, 1, Some((1.0, 2.0)));
+        w1.layout.window_size = (300, 500);
+        let w2 = mock_window(2, false, true, 1, Some((1.0, 2.0)));
+        let mock = MockNiri::new(vec![w1, w2]);
+
+        let mut config = mock_config();
+        config.interaction.stack_direction = StackDirection::TopToBottom;
+
+        let mut state = AppState::default();
+        for id in [1, 2] {
+            state.windows.push(WindowState {
+                id,
+                width: 300,
+                height: 200,
+                is_floating: false,
+                position: None,
+            });
+        }
+
+        let mut ctx = Ctx {
+            state,
+            config,
+            socket: mock,
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+
+        reorder(&mut ctx).expect("Reorder failed");
+
+        // Window 1 is stuck at 500px tall even though 200 was requested: top margin 50 + 500 + gap 10
+        assert!(ctx.socket.sent_actions.iter().any(|a| matches!(
+            a,
+            Action::MoveFloatingWindow {
+                id: Some(2),
+                y: PositionChange::SetFixed(560.0),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_shown_and_focus_peek_positions_match_when_focus_peek_reveals_window() {
+        let x_for = |hidden: bool, focused: bool| {
+            let temp_dir = tempdir().unwrap();
+            let mock = MockNiri::new(vec![mock_window(1, focused, true, 1, Some((1.0, 2.0)))]);
+            let mut config = mock_config();
+            config.interaction.position = SidebarPosition::Right;
+            config.geometry.width = 300;
+            config.interaction.focus_peek = Some(310);
+            let mut state = AppState::default();
+            state.is_hidden = hidden;
+            state.windows.push(WindowState {
+                id: 1,
+                width: 300,
+                height: 200,
+                is_floating: false,
+                position: None,
+            });
+            let mut ctx = Ctx {
+                state,
+                config,
+                socket: mock,
+                cache_dir: temp_dir.path().to_path_buf(),
+            };
+            reorder(&mut ctx).expect("Reorder failed");
+            ctx.socket
+                .sent_actions
+                .iter()
+                .find_map(|a| match a {
+                    Action::MoveFloatingWindow {
+                        x: PositionChange::SetFixed(x),
+                        ..
+                    } => Some(*x),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        // Screen width 1920: 1920 - 310 (focus peek), not 1920 - 300 - 20 (margin)
+        assert_eq!(x_for(false, false), 1610.0);
+        assert_eq!(x_for(true, true), 1610.0);
     }
 
     #[test]

@@ -152,10 +152,19 @@ peek = 10
 # Width of window when sidebar is hidden but window is focused in pixels
 # set this equal to peek to disable this feature
 # set this equal to sidebar_width + offset_right to make focused windows "unhide"
+# when it is at least the window width, the shown sidebar uses the same gap
+# (focus_peek - width) instead of the margin, so both positions line up
 # Optional and defaults to peek if ommitted
 focus_peek = 50
 # Whether the sidebar should follow if you switch workspaces
 sticky = false
+# Expand the sidebar when the pointer touches the screen edge it is docked to,
+# and collapse it once the pointer leaves (runs inside `niri-sidebar listen`)
+hover = false
+# Width of the screen-edge strip that triggers the expand, in pixels (defaults to `peek`)
+# hover_zone_width = 1
+# How long the pointer must stay outside the sidebar before it collapses, in ms
+hover_collapse_delay_ms = 200
 ```
 
 #### Window Rules

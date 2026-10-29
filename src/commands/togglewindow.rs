@@ -132,12 +132,12 @@ mod tests {
 
         toggle_window(&mut ctx).expect("Command failed");
 
-        // Window 100 should be in the sidebar list with original size (1000x800)
+        // Window 100 should be in the sidebar list with original size (100x100)
         assert_eq!(ctx.state.windows.len(), 1);
         let w_state = &ctx.state.windows[0];
         assert_eq!(w_state.id, 100);
-        assert_eq!(w_state.width, 1000);
-        assert_eq!(w_state.height, 800);
+        assert_eq!(w_state.width, 100);
+        assert_eq!(w_state.height, 100);
         assert!(!w_state.is_floating);
         assert_eq!(w_state.position, None);
 
@@ -177,12 +177,12 @@ mod tests {
 
         toggle_window(&mut ctx).expect("Command failed");
 
-        // Window 100 should be in the sidebar list with original size (1000x800)
+        // Window 100 should be in the sidebar list with original size (100x100)
         assert_eq!(ctx.state.windows.len(), 1);
         let w_state = &ctx.state.windows[0];
         assert_eq!(w_state.id, 100);
-        assert_eq!(w_state.width, 1000);
-        assert_eq!(w_state.height, 800);
+        assert_eq!(w_state.width, 100);
+        assert_eq!(w_state.height, 100);
         assert!(w_state.is_floating);
         assert_eq!(w_state.position, Some((1.0, 2.0)));
 

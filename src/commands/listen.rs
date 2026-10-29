@@ -12,6 +12,9 @@ use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Request, Window};
 
 pub fn listen(mut ctx: Ctx<Socket>) -> Result<()> {
+    if ctx.config.interaction.hover {
+        super::hover::spawn(&ctx.config);
+    }
     let _ = ctx.socket.send(Request::EventStream)?;
     let mut read_event = ctx.socket.read_events();
     println!("niri-sidebar: Listening for window events...");
@@ -29,7 +32,7 @@ pub fn listen(mut ctx: Ctx<Socket>) -> Result<()> {
     Ok(())
 }
 
-fn get_ctx() -> Result<(Ctx<Socket>, LockFile)> {
+pub(crate) fn get_ctx() -> Result<(Ctx<Socket>, LockFile)> {
     let cache_dir = get_default_cache_dir()?;
     let mut lock_path = cache_dir.clone();
     lock_path.push("instance.lock");

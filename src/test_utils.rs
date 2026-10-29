@@ -71,7 +71,7 @@ pub fn mock_window(
         pid: Some(123),
         is_urgent: false,
         layout: WindowLayout {
-            window_size: (1000, 800),
+            window_size: (100, 100),
             pos_in_scrolling_layout: None,
             tile_size: (0.0, 0.0),
             tile_pos_in_workspace_view: position,

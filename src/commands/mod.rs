@@ -2,6 +2,7 @@ mod close;
 mod flip;
 mod focus;
 mod hide;
+mod hover;
 mod listen;
 mod movefrom;
 mod reorder;
