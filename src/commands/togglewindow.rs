@@ -93,12 +93,14 @@ fn remove_from_sidebar<C: NiriClient>(ctx: &mut Ctx<C>, window: &Window) -> Resu
         });
         // Sizes sent while floating don't carry over to the tiled layout, and a
         // tiled window's height is automatic (fills the column), so reset it.
-        for delay_ms in [150, 450] {
+        for (i, delay_ms) in [150, 450].into_iter().enumerate() {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            let _ = ctx.socket.send_action(Action::SetWindowWidth {
-                change: SizeChange::SetFixed(w_state.width),
-                id: Some(window.id),
-            });
+            if i == 0 {
+                let _ = ctx.socket.send_action(Action::SetWindowWidth {
+                    change: SizeChange::SetFixed(w_state.width),
+                    id: Some(window.id),
+                });
+            }
             let _ = ctx.socket.send_action(Action::ResetWindowHeight {
                 id: Some(window.id),
             });
