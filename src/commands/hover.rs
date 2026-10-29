@@ -77,6 +77,7 @@ struct Hover {
     // Thickness from the docked edge, and the edge span, the pointer may roam without collapsing
     safe_thickness: i32,
     safe_span: Option<(i32, i32)>,
+    overlay_size: (i32, i32),
     collapse_timer: Option<RegistrationToken>,
 }
 
@@ -174,6 +175,7 @@ fn run(cfg: HoverConfig, fallback_thickness: i32) -> Result<()> {
         overlay: None,
         safe_thickness: fallback_thickness,
         safe_span: None,
+        overlay_size: (0, 0),
         collapse_timer: None,
     };
 
@@ -435,6 +437,16 @@ impl Hover {
         }
     }
 
+    fn overlay_leave_returns_to_safe_area(&self, position: (f64, f64)) -> bool {
+        leave_enters_safe_area(
+            self.cfg.position,
+            position,
+            self.overlay_size,
+            self.safe_thickness,
+            self.safe_span,
+        )
+    }
+
     /// Areas of the overlay that must not capture the pointer.
     fn exclusions(&self, w: i32, h: i32) -> Vec<Rect> {
         let pos = self.cfg.position;
@@ -488,6 +500,7 @@ impl LayerShellHandler for Hover {
             return;
         }
         if self.overlay.as_ref().is_some_and(|o| o == layer) {
+            self.overlay_size = (w, h);
             if let Ok(region) = Region::new(&self.compositor) {
                 region.add(0, 0, w, h);
                 for (x, y, rw, rh) in self.exclusions(w, h) {
@@ -527,10 +540,50 @@ impl PointerHandler for Hover {
                     }
                 }
                 PointerEventKind::Enter { .. } if on_overlay => self.start_collapse_timer(),
-                PointerEventKind::Leave { .. } if on_overlay => self.cancel_collapse_timer(),
+                PointerEventKind::Leave { .. }
+                    if on_overlay && self.overlay_leave_returns_to_safe_area(event.position) =>
+                {
+                    self.cancel_collapse_timer()
+                }
+                PointerEventKind::Leave { .. } if on_overlay => self.start_collapse_timer(),
                 _ => {}
             }
         }
+    }
+}
+
+fn leave_enters_safe_area(
+    position: SidebarPosition,
+    (x, y): (f64, f64),
+    (w, h): (i32, i32),
+    thickness: i32,
+    span: Option<(i32, i32)>,
+) -> bool {
+    const EDGE_TOLERANCE: f64 = 4.0;
+
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+
+    let (span_start, span_len) = span.unwrap_or_else(|| {
+        if is_vertical_edge(position) {
+            (0, h)
+        } else {
+            (0, w)
+        }
+    });
+    let along = if is_vertical_edge(position) { y } else { x };
+    let in_span = along >= f64::from(span_start) - EDGE_TOLERANCE
+        && along <= f64::from(span_start + span_len) + EDGE_TOLERANCE;
+    if !in_span {
+        return false;
+    }
+
+    match position {
+        SidebarPosition::Right => x >= f64::from(w - thickness.max(0)) - EDGE_TOLERANCE,
+        SidebarPosition::Left => x <= f64::from(thickness.max(0)) + EDGE_TOLERANCE,
+        SidebarPosition::Bottom => y >= f64::from(h - thickness.max(0)) - EDGE_TOLERANCE,
+        SidebarPosition::Top => y <= f64::from(thickness.max(0)) + EDGE_TOLERANCE,
     }
 }
 
@@ -655,5 +708,33 @@ mod tests {
             edge_rect(SidebarPosition::Top, 30, span, 1000, 500),
             (40, 0, 100, 30)
         );
+    }
+
+    #[test]
+    fn overlay_leave_distinguishes_window_from_other_monitor() {
+        let size = (2560, 1440);
+        let span = Some((360, 560));
+
+        assert!(leave_enters_safe_area(
+            SidebarPosition::Right,
+            (1541.0, 500.0),
+            size,
+            1018,
+            span,
+        ));
+        assert!(!leave_enters_safe_area(
+            SidebarPosition::Right,
+            (0.0, 500.0),
+            size,
+            1018,
+            span,
+        ));
+        assert!(!leave_enters_safe_area(
+            SidebarPosition::Right,
+            (1541.0, 1000.0),
+            size,
+            1018,
+            span,
+        ));
     }
 }
